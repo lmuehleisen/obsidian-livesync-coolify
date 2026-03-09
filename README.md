@@ -63,14 +63,25 @@ This plug-in may be particularly useful for researchers, engineers, and develope
    COUCHDB_PASSWORD=your_secure_password_here
    ```
 
-4. **Configure domain:**
+4. **Add persistent storage in Coolify:**
+   - Open the resource's **Persistent Storage** tab
+   - Add a **Volume** mounted to `/opt/couchdb/data`
+   - Deploy only after the volume is attached, otherwise CouchDB data will be lost on redeploy
+
+5. **Configure domain:**
    - Add your custom domain or use Coolify's provided domain
    - SSL will be automatically configured
 
-5. **Deploy:**
+6. **Deploy:**
    - Click "Deploy"
    - Wait for build to complete (2-3 minutes)
    - Health check should pass
+   - If health checks are configured in both the Coolify UI and the Dockerfile, the Dockerfile health check is the one Coolify will use
+
+> **Important first boot behavior**
+> - Set `COUCHDB_USER` and `COUCHDB_PASSWORD` before the first successful deployment.
+> - CouchDB writes the admin credentials into container configuration on startup; changing the environment variables later does not safely rotate an already-initialized deployment by itself.
+> - Treat the first deploy as the moment your persistent volume becomes bound to those credentials.
 
 #### Step 2: Configure Obsidian
 
@@ -153,8 +164,8 @@ To prevent file and database corruption, please wait to stop Obsidian until all 
 This repository includes production-ready files for seamless Coolify deployment:
 
 ### Docker Configuration
-- **`Dockerfile`** - Production CouchDB 3.4.2 with authentication and CORS
-- **`docker-compose.yml`** - Complete orchestration with persistent volumes
+- **`Dockerfile`** - Production CouchDB 3.4 with authentication, CORS, and startup validation for required credentials
+- **`docker-compose.yml`** - Local/manual orchestration reference with authenticated health checks
 - **`nixpacks.toml`** - Forces Coolify to use Dockerfile instead of auto-detection
 - **`.dockerignore`** - Optimized build context (excludes unnecessary files)
 
@@ -169,6 +180,7 @@ This repository includes production-ready files for seamless Coolify deployment:
 ### Environment Setup
 - **`.env.example`** - Template with secure defaults
 - Environment variables: `COUCHDB_USER`, `COUCHDB_PASSWORD`
+- Coolify persistent volume mount: `/opt/couchdb/data`
 - Automatic SSL/TLS via Coolify reverse proxy
 
 ### Features
@@ -188,6 +200,7 @@ This repository includes production-ready files for seamless Coolify deployment:
 2. **Health check fails:**
    - Wait 2-3 minutes for CouchDB initialization
    - Verify COUCHDB_USER and COUCHDB_PASSWORD are set
+   - Verify the persistent volume is mounted at `/opt/couchdb/data`
    - Check logs for any startup errors
 
 3. **Connection refused from Obsidian:**
