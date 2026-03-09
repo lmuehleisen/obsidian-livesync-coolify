@@ -2,48 +2,53 @@ import { AbstractModule } from "../AbstractModule.ts";
 import { LOG_LEVEL_NOTICE, type FilePathWithPrefix } from "../../lib/src/common/types";
 import { QueueProcessor } from "octagonal-wheels/concurrency/processor";
 import { sendValue } from "octagonal-wheels/messagepassing/signal";
-import type { ICoreModule } from "../ModuleTypes.ts";
+import type { InjectableServiceHub } from "../../lib/src/services/InjectableServices.ts";
+import type { LiveSyncCore } from "../../main.ts";
 
-export class ModuleConflictChecker extends AbstractModule implements ICoreModule {
-    async $$queueConflictCheckIfOpen(file: FilePathWithPrefix): Promise<void> {
+export class ModuleConflictChecker extends AbstractModule {
+    async _queueConflictCheckIfOpen(file: FilePathWithPrefix): Promise<void> {
         const path = file;
         if (this.settings.checkConflictOnlyOnOpen) {
-            const af = this.core.$$getActiveFilePath();
+            const af = this.services.vault.getActiveFilePath();
             if (af && af != path) {
                 this._log(`${file} is conflicted, merging process has been postponed.`, LOG_LEVEL_NOTICE);
                 return;
             }
         }
-        await this.core.$$queueConflictCheck(path);
+        await this.services.conflict.queueCheckFor(path);
     }
 
-    async $$queueConflictCheck(file: FilePathWithPrefix): Promise<void> {
-        const optionalConflictResult = await this.core.$anyGetOptionalConflictCheckMethod(file);
+    async _queueConflictCheck(file: FilePathWithPrefix): Promise<void> {
+        const optionalConflictResult = await this.services.conflict.getOptionalConflictCheckMethod(file);
         if (optionalConflictResult == true) {
             // The conflict has been resolved by another process.
             return;
         } else if (optionalConflictResult === "newer") {
             // The conflict should be resolved by the newer entry.
-            await this.core.$anyResolveConflictByNewest(file);
+            await this.services.conflict.resolveByNewest(file);
         } else {
             this.conflictCheckQueue.enqueue(file);
         }
     }
 
-    $$waitForAllConflictProcessed(): Promise<boolean> {
+    _waitForAllConflictProcessed(): Promise<boolean> {
         return this.conflictResolveQueue.waitForAllProcessed();
     }
 
     // TODO-> Move to ModuleConflictResolver?
     conflictResolveQueue = new QueueProcessor(
         async (filenames: FilePathWithPrefix[]) => {
-            await this.core.$$resolveConflict(filenames[0]);
+            const filename = filenames[0];
+            return await this.services.conflict.resolve(filename);
         },
         {
             suspended: false,
             batchSize: 1,
-            concurrentLimit: 1,
-            delay: 10,
+            // No need to limit concurrency to `1` here, subsequent process will handle it,
+            // And, some cases, we do not need to synchronised. (e.g., auto-merge available).
+            // Therefore, limiting global concurrency is performed on resolver with the UI.
+            concurrentLimit: 10,
+            delay: 0,
             keepResultUntilDownstreamConnected: false,
         }
     ).replaceEnqueueProcessor((queue, newEntity) => {
@@ -57,22 +62,21 @@ export class ModuleConflictChecker extends AbstractModule implements ICoreModule
         new QueueProcessor(
             (files: FilePathWithPrefix[]) => {
                 const filename = files[0];
-                // const file = await this.core.storageAccess.isExists(filename);
-                // if (!file) return [];
-                // if (!(file instanceof TFile)) return;
-                // if ((file instanceof TFolder)) return [];
-                // Check again?
                 return Promise.resolve([filename]);
-                // this.conflictResolveQueue.enqueueWithKey(filename, { filename, file });
             },
             {
                 suspended: false,
                 batchSize: 1,
-                concurrentLimit: 5,
-                delay: 10,
+                concurrentLimit: 10,
+                delay: 0,
                 keepResultUntilDownstreamConnected: true,
                 pipeTo: this.conflictResolveQueue,
-                totalRemainingReactiveSource: this.core.conflictProcessQueueCount,
+                totalRemainingReactiveSource: this.services.conflict.conflictProcessQueueCount,
             }
         );
+    override onBindFunction(core: LiveSyncCore, services: InjectableServiceHub): void {
+        services.conflict.queueCheckForIfOpen.setHandler(this._queueConflictCheckIfOpen.bind(this));
+        services.conflict.queueCheckFor.setHandler(this._queueConflictCheck.bind(this));
+        services.conflict.ensureAllProcessed.setHandler(this._waitForAllConflictProcessed.bind(this));
+    }
 }

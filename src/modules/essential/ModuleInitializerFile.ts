@@ -1,7 +1,7 @@
 import { unique } from "octagonal-wheels/collection";
 import { throttle } from "octagonal-wheels/function";
-import { eventHub } from "../../common/events.ts";
-import { BASE_IS_NEW, compareFileFreshness, EVEN, getPath, isValidPath, TARGET_IS_NEW } from "../../common/utils.ts";
+import { EVENT_ON_UNRESOLVED_ERROR, eventHub } from "../../common/events.ts";
+import { BASE_IS_NEW, EVEN, isValidPath, TARGET_IS_NEW } from "../../common/utils.ts";
 import {
     type FilePathWithPrefixLC,
     type FilePathWithPrefix,
@@ -13,30 +13,59 @@ import {
     LOG_LEVEL_INFO,
     LOG_LEVEL_DEBUG,
     type UXFileInfoStub,
+    type LOG_LEVEL,
 } from "../../lib/src/common/types.ts";
 import { isAnyNote } from "../../lib/src/common/utils.ts";
 import { stripAllPrefixes } from "../../lib/src/string_and_binary/path.ts";
 import { AbstractModule } from "../AbstractModule.ts";
-import type { ICoreModule } from "../ModuleTypes.ts";
 import { withConcurrency } from "octagonal-wheels/iterable/map";
-export class ModuleInitializerFile extends AbstractModule implements ICoreModule {
-    async $$performFullScan(showingNotice?: boolean): Promise<void> {
+import type { InjectableServiceHub } from "../../lib/src/services/InjectableServices.ts";
+import type { LiveSyncCore } from "../../main.ts";
+export class ModuleInitializerFile extends AbstractModule {
+    private _detectedErrors = new Set<string>();
+
+    private logDetectedError(message: string, logLevel: LOG_LEVEL = LOG_LEVEL_INFO, key?: string) {
+        this._detectedErrors.add(message);
+        eventHub.emitEvent(EVENT_ON_UNRESOLVED_ERROR);
+        this._log(message, logLevel, key);
+    }
+    private resetDetectedError(message: string) {
+        eventHub.emitEvent(EVENT_ON_UNRESOLVED_ERROR);
+        this._detectedErrors.delete(message);
+    }
+    private async _performFullScan(showingNotice?: boolean, ignoreSuspending: boolean = false): Promise<boolean> {
         this._log("Opening the key-value database", LOG_LEVEL_VERBOSE);
         const isInitialized = (await this.core.kvDB.get<boolean>("initialized")) || false;
         // synchronize all files between database and storage.
+
+        const ERR_NOT_CONFIGURED =
+            "LiveSync is not configured yet. Synchronising between the storage and the local database is now prevented.";
         if (!this.settings.isConfigured) {
-            if (showingNotice) {
-                this._log(
-                    "LiveSync is not configured yet. Synchronising between the storage and the local database is now prevented.",
-                    LOG_LEVEL_NOTICE,
-                    "syncAll"
-                );
-            }
-            return;
+            this.logDetectedError(ERR_NOT_CONFIGURED, showingNotice ? LOG_LEVEL_NOTICE : LOG_LEVEL_INFO, "syncAll");
+            return false;
         }
+        this.resetDetectedError(ERR_NOT_CONFIGURED);
+
+        const ERR_SUSPENDING =
+            "Now suspending file watching. Synchronising between the storage and the local database is now prevented.";
+        if (!ignoreSuspending && this.settings.suspendFileWatching) {
+            this.logDetectedError(ERR_SUSPENDING, showingNotice ? LOG_LEVEL_NOTICE : LOG_LEVEL_INFO, "syncAll");
+            return false;
+        }
+        const MSG_IN_REMEDIATION = `Started in remediation Mode! (Max mtime for reflect events is set). Synchronising between the storage and the local database is now prevented.`;
+        this.resetDetectedError(ERR_SUSPENDING);
+        if (this.settings.maxMTimeForReflectEvents > 0) {
+            this.logDetectedError(MSG_IN_REMEDIATION, LOG_LEVEL_NOTICE, "syncAll");
+            return false;
+        }
+        this.resetDetectedError(MSG_IN_REMEDIATION);
 
         if (showingNotice) {
             this._log("Initializing", LOG_LEVEL_NOTICE, "syncAll");
+        }
+        if (isInitialized) {
+            this._log("Restoring storage state", LOG_LEVEL_VERBOSE);
+            await this.core.storageAccess.restoreState();
         }
 
         this._log("Initialize and checking database files");
@@ -49,7 +78,7 @@ export class ModuleInitializerFile extends AbstractModule implements ICoreModule
         const _filesStorage = [] as typeof filesStorageSrc;
 
         for (const f of filesStorageSrc) {
-            if (await this.core.$$isTargetFile(f.path, f != filesStorageSrc[0])) {
+            if (await this.services.vault.isTargetFile(f.path)) {
                 _filesStorage.push(f);
             }
         }
@@ -91,9 +120,9 @@ export class ModuleInitializerFile extends AbstractModule implements ICoreModule
                     showingNotice ? LOG_LEVEL_NOTICE : LOG_LEVEL_INFO,
                     "syncAll"
                 );
-            const path = getPath(doc);
+            const path = this.getPath(doc);
 
-            if (isValidPath(path) && (await this.core.$$isTargetFile(path, true))) {
+            if (isValidPath(path) && (await this.services.vault.isTargetFile(path))) {
                 if (!isMetaEntry(doc)) {
                     this._log(`Invalid entry: ${path}`, LOG_LEVEL_INFO);
                     continue;
@@ -103,7 +132,7 @@ export class ModuleInitializerFile extends AbstractModule implements ICoreModule
         }
 
         const databaseFileNameMap = Object.fromEntries(
-            _DBEntries.map((e) => [getPath(e), e] as [FilePathWithPrefix, MetaEntry])
+            _DBEntries.map((e) => [this.getPath(e), e] as [FilePathWithPrefix, MetaEntry])
         );
         const databaseFileNames = Object.keys(databaseFileNameMap) as FilePathWithPrefix[];
         const databaseFileNameCapsPair = databaseFileNames.map(
@@ -123,7 +152,6 @@ export class ModuleInitializerFile extends AbstractModule implements ICoreModule
         this._log(`Total files in the database: ${databaseFileNames.length}`, LOG_LEVEL_VERBOSE, "syncAll");
         this._log(`Total files in the storage: ${storageFileNames.length}`, LOG_LEVEL_VERBOSE, "syncAll");
         this._log(`Total files: ${allFiles.length}`, LOG_LEVEL_VERBOSE, "syncAll");
-
         const filesExistOnlyInStorage = allFiles.filter((e) => !databaseFileNameCI2CS[e]);
         const filesExistOnlyInDatabase = allFiles.filter((e) => !storageFileNameCI2CS[e]);
         const filesExistBoth = allFiles.filter((e) => databaseFileNameCI2CS[e] && storageFileNameCI2CS[e]);
@@ -182,7 +210,7 @@ export class ModuleInitializerFile extends AbstractModule implements ICoreModule
             runAll("UPDATE DATABASE", filesExistOnlyInStorage, async (e) => {
                 // Exists in storage but not in database.
                 const file = storageFileNameMap[storageFileNameCI2CS[e]];
-                if (!this.core.$$isFileSizeExceeded(file.stat.size)) {
+                if (!this.services.vault.isFileSizeTooLarge(file.stat.size)) {
                     const path = file.path;
                     await this.core.fileHandler.storeFileToDB(file);
                     // fireAndForget(() => this.checkAndApplySettingFromMarkdown(path, true));
@@ -196,9 +224,9 @@ export class ModuleInitializerFile extends AbstractModule implements ICoreModule
             runAll("UPDATE STORAGE", filesExistOnlyInDatabase, async (e) => {
                 const w = databaseFileNameMap[databaseFileNameCI2CS[e]];
                 // Exists in database but not in storage.
-                const path = getPath(w) ?? e;
+                const path = this.getPath(w) ?? e;
                 if (w && !(w.deleted || w._deleted)) {
-                    if (!this.core.$$isFileSizeExceeded(w.size)) {
+                    if (!this.services.vault.isFileSizeTooLarge(w.size)) {
                         // Prevent applying the conflicted state to the storage.
                         if (w._conflicts?.length ?? 0 > 0) {
                             this._log(`UPDATE STORAGE: ${path} has conflicts. skipped (x)`, LOG_LEVEL_INFO);
@@ -240,11 +268,14 @@ export class ModuleInitializerFile extends AbstractModule implements ICoreModule
                     this._log(`SYNC DATABASE AND STORAGE: ${file.path} has conflicts. skipped`, LOG_LEVEL_INFO);
                     return;
                 }
-                if (!this.core.$$isFileSizeExceeded(file.stat.size) && !this.core.$$isFileSizeExceeded(doc.size)) {
+                if (
+                    !this.services.vault.isFileSizeTooLarge(file.stat.size) &&
+                    !this.services.vault.isFileSizeTooLarge(doc.size)
+                ) {
                     await this.syncFileBetweenDBandStorage(file, doc);
                 } else {
                     this._log(
-                        `SYNC DATABASE AND STORAGE: ${getPath(doc)} has been skipped due to file size exceeding the limit`,
+                        `SYNC DATABASE AND STORAGE: ${this.getPath(doc)} has been skipped due to file size exceeding the limit`,
                         logLevel
                     );
                 }
@@ -261,6 +292,7 @@ export class ModuleInitializerFile extends AbstractModule implements ICoreModule
         if (showingNotice) {
             this._log("Initialize done!", LOG_LEVEL_NOTICE, "syncAll");
         }
+        return true;
     }
 
     async syncFileBetweenDBandStorage(file: UXFileInfoStub, doc: MetaEntry) {
@@ -276,10 +308,10 @@ export class ModuleInitializerFile extends AbstractModule implements ICoreModule
             }
         }
 
-        const compareResult = compareFileFreshness(file, doc);
+        const compareResult = this.services.path.compareFileFreshness(file, doc);
         switch (compareResult) {
             case BASE_IS_NEW:
-                if (!this.core.$$isFileSizeExceeded(file.stat.size)) {
+                if (!this.services.vault.isFileSizeTooLarge(file.stat.size)) {
                     this._log("STORAGE -> DB :" + file.path);
                     await this.core.fileHandler.storeFileToDB(file);
                 } else {
@@ -290,7 +322,7 @@ export class ModuleInitializerFile extends AbstractModule implements ICoreModule
                 }
                 break;
             case TARGET_IS_NEW:
-                if (!this.core.$$isFileSizeExceeded(doc.size)) {
+                if (!this.services.vault.isFileSizeTooLarge(doc.size)) {
                     this._log("STORAGE <- DB :" + file.path);
                     if (await this.core.fileHandler.dbToStorage(doc, stripAllPrefixes(file.path), true)) {
                         eventHub.emitEvent("event-file-changed", {
@@ -333,7 +365,7 @@ export class ModuleInitializerFile extends AbstractModule implements ICoreModule
             if (isAnyNote(doc)) {
                 if (doc.deleted && doc.mtime - limit < 0) {
                     notes.push({
-                        path: getPath(doc),
+                        path: this.getPath(doc),
                         mtime: doc.mtime,
                         ttl: (doc.mtime - limit) / 1000 / 86400,
                         doc: doc,
@@ -355,23 +387,43 @@ export class ModuleInitializerFile extends AbstractModule implements ICoreModule
         this._log(`Checking expired file history done`);
     }
 
-    async $$initializeDatabase(showingNotice: boolean = false, reopenDatabase = true): Promise<boolean> {
-        this.core.$$resetIsReady();
-        if (!reopenDatabase || (await this.core.$$openDatabase())) {
+    private async _initializeDatabase(
+        showingNotice: boolean = false,
+        reopenDatabase = true,
+        ignoreSuspending: boolean = false
+    ): Promise<boolean> {
+        this.services.appLifecycle.resetIsReady();
+        if (
+            !reopenDatabase ||
+            (await this.services.database.openDatabase({
+                databaseEvents: this.services.databaseEvents,
+                replicator: this.services.replicator,
+            }))
+        ) {
             if (this.localDatabase.isReady) {
-                await this.core.$$performFullScan(showingNotice);
+                await this.services.vault.scanVault(showingNotice, ignoreSuspending);
             }
-            if (!(await this.core.$everyOnDatabaseInitialized(showingNotice))) {
-                this._log(`Initializing database has been failed on some module`, LOG_LEVEL_NOTICE);
+            const ERR_INITIALISATION_FAILED = `Initializing database has been failed on some module!`;
+            if (!(await this.services.databaseEvents.onDatabaseInitialised(showingNotice))) {
+                this.logDetectedError(ERR_INITIALISATION_FAILED, LOG_LEVEL_NOTICE);
                 return false;
             }
-            this.core.$$markIsReady();
+            this.resetDetectedError(ERR_INITIALISATION_FAILED);
+            this.services.appLifecycle.markIsReady();
             // run queued event once.
-            await this.core.$everyCommitPendingFileEvent();
+            await this.services.fileProcessing.commitPendingFileEvents();
             return true;
         } else {
-            this.core.$$resetIsReady();
+            this.services.appLifecycle.resetIsReady();
             return false;
         }
+    }
+    private _reportDetectedErrors(): Promise<string[]> {
+        return Promise.resolve(Array.from(this._detectedErrors));
+    }
+    override onBindFunction(core: LiveSyncCore, services: InjectableServiceHub): void {
+        services.appLifecycle.getUnresolvedMessages.addHandler(this._reportDetectedErrors.bind(this));
+        services.databaseEvents.initialiseDatabase.addHandler(this._initializeDatabase.bind(this));
+        services.vault.scanVault.addHandler(this._performFullScan.bind(this));
     }
 }

@@ -1,15 +1,20 @@
-.added {
+.ls-dialog .added {
     color: var(--text-on-accent);
     background-color: var(--text-accent);
 }
 
-.normal {
+.ls-dialog .normal {
     color: var(--text-normal);
 }
 
-.deleted {
+.ls-dialog .deleted {
     color: var(--text-on-accent);
     background-color: var(--text-muted);
+}
+
+.conflict-dev-name {
+    display: inline-block;
+    min-width: 5em;
 }
 
 .op-scrollable {
@@ -105,10 +110,10 @@
 div.sls-setting-menu-btn {
     color: var(--text-normal);
     background-color: var(--background-secondary-alt);
-    border-radius: 4px 4px 0 0;
+    border-radius: 8px;
     padding: 6px 10px;
     cursor: pointer;
-    margin-right: 12px;
+    margin-right: 2px;
     font-family: "Inter", sans-serif;
     outline: none;
     user-select: none;
@@ -135,9 +140,9 @@ div.sls-setting-menu-btn {
     flex-grow: 1;
     position: sticky;
     top: 0;
-    background-color: rgba(var(--background-primary), 0.3);
-    backdrop-filter: blur(4px);
-    border-radius: 4px;
+    backdrop-filter: blur(15px);
+    padding: 4px;
+    border-radius: 10px;
     z-index: 10;
 }
 
@@ -385,6 +390,18 @@ span.ls-mark-cr::after {
     font-size: 80%;
 }
 
+div.workspace-leaf-content[data-type=bases]  .livesync-status {
+    top: calc(var(--bases-header-height) + var(--header-height));
+    padding: 5px;
+    padding-right: 18px;
+}
+
+.is-mobile div.workspace-leaf-content[data-type=bases]  .livesync-status {
+    top: calc(var(--bases-header-height) + var(--view-header-height));
+    padding: 6px;
+    padding-right: 18px;
+}
+
 .livesync-status div {
     opacity: 0.6;
     -webkit-filter: grayscale(100%);
@@ -397,13 +414,21 @@ span.ls-mark-cr::after {
 
 }
 
-.livesync-status div.livesync-status-messagearea {
+.livesync-status div.livesync-status-messagearea:empty {
+    display: none;
+}
+
+.livesync-status div.livesync-status-messagearea:not(:empty) {
     opacity: 0.6;
     color: var(--text-on-accent);
-    background: var(--background-modifier-error);
+    border: 1px solid var(--background-modifier-error);
+    background-color: rgba(var(--background-modifier-error-rgb), 0.2);
     -webkit-filter: unset;
     filter: unset;
+    width: fit-content;
+    margin-left: auto;
 }
+
 
 .menu-setting-poweruser-disabled .sls-setting-poweruser {
     display: none;
@@ -419,13 +444,15 @@ span.ls-mark-cr::after {
 
 .sls-setting-panel-title {
     position: sticky;
+    font-size: medium;
+    top: 2.5em;
+    background-color: var(--background-secondary-alt);
+    border-radius: 10px;
+    padding: 0.5em 1.0em;
 }
 
-.sls-setting-panel-title {
-    top: 2em;
-    background-color: rgba(var(--background-primary), 0.3);
-    backdrop-filter: blur(4px);
-    border-radius: 30%;
+.active-pane .sls-setting-panel-title {
+    border: 1px solid var(--interactive-accent);
 }
 
 .sls-dialogue-note-wrapper {

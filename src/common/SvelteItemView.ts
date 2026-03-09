@@ -1,10 +1,10 @@
-import { ItemView } from "obsidian";
+import { ItemView } from "@/deps.ts";
 import { type mount, unmount } from "svelte";
 
 export abstract class SvelteItemView extends ItemView {
     abstract instantiateComponent(target: HTMLElement): ReturnType<typeof mount> | Promise<ReturnType<typeof mount>>;
     component?: ReturnType<typeof mount>;
-    async onOpen() {
+    override async onOpen() {
         await super.onOpen();
         this.contentEl.empty();
         await this._dismountComponent();
@@ -17,7 +17,7 @@ export abstract class SvelteItemView extends ItemView {
             this.component = undefined;
         }
     }
-    async onClose() {
+    override async onClose() {
         await super.onClose();
         if (this.component) {
             await unmount(this.component);

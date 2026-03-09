@@ -1,4 +1,4 @@
-import { normalizePath, type PluginManifest, type ListedFiles } from "../../deps.ts";
+import { type PluginManifest, type ListedFiles } from "../../deps.ts";
 import {
     type LoadedEntry,
     type FilePathWithPrefix,
@@ -10,7 +10,6 @@ import {
     MODE_PAUSED,
     type SavingEntry,
     type DocumentID,
-    type FilePathWithPrefixLC,
     type UXFileInfo,
     type UXStat,
     LOG_LEVEL_DEBUG,
@@ -30,33 +29,38 @@ import {
 } from "../../lib/src/common/utils.ts";
 import {
     compareMTime,
-    unmarkChanges,
-    getPath,
     isInternalMetadata,
-    markChangesAreSame,
     PeriodicProcessor,
     TARGET_IS_NEW,
     scheduleTask,
-    getDocProps,
     getLogLevel,
     autosaveCache,
     type MapLike,
     onlyInNTimes,
     BASE_IS_NEW,
     EVEN,
+    displayRev,
 } from "../../common/utils.ts";
-import { serialized, skipIfDuplicated } from "../../lib/src/concurrency/lock.ts";
+import { serialized, skipIfDuplicated } from "octagonal-wheels/concurrency/lock";
 import { JsonResolveModal } from "../HiddenFileCommon/JsonResolveModal.ts";
 import { LiveSyncCommands } from "../LiveSyncCommands.ts";
 import { addPrefix, stripAllPrefixes } from "../../lib/src/string_and_binary/path.ts";
-import { QueueProcessor } from "../../lib/src/concurrency/processor.ts";
+import { QueueProcessor } from "octagonal-wheels/concurrency/processor";
 import { hiddenFilesEventCount, hiddenFilesProcessingCount } from "../../lib/src/mock_and_interop/stores.ts";
-import type { IObsidianModule } from "../../modules/AbstractObsidianModule.ts";
 import { EVENT_SETTING_SAVED, eventHub } from "../../common/events.ts";
-import type { LiveSyncLocalDB } from "../../lib/src/pouchdb/LiveSyncLocalDB.ts";
 import { Semaphore } from "octagonal-wheels/concurrency/semaphore";
+import type { LiveSyncCore } from "../../main.ts";
 type SyncDirection = "push" | "pull" | "safe" | "pullForce" | "pushForce";
 
+declare global {
+    interface OPTIONAL_SYNC_FEATURES {
+        FETCH: "FETCH";
+        OVERWRITE: "OVERWRITE";
+        MERGE: "MERGE";
+        DISABLE: "DISABLE";
+        DISABLE_HIDDEN: "DISABLE_HIDDEN";
+    }
+}
 function getComparingMTime(
     doc: (MetaEntry | LoadedEntry | false) | UXFileInfo | UXStat | null | undefined,
     includeDeleted = false
@@ -72,21 +76,21 @@ function getComparingMTime(
     return doc.mtime ?? 0;
 }
 
-export class HiddenFileSync extends LiveSyncCommands implements IObsidianModule {
-    _isThisModuleEnabled() {
+export class HiddenFileSync extends LiveSyncCommands {
+    isThisModuleEnabled() {
         return this.plugin.settings.syncInternalFiles;
     }
 
     periodicInternalFileScanProcessor: PeriodicProcessor = new PeriodicProcessor(
         this.plugin,
-        async () => this._isThisModuleEnabled() && this._isDatabaseReady() && (await this.scanAllStorageChanges(false))
+        async () => this.isThisModuleEnabled() && this._isDatabaseReady() && (await this.scanAllStorageChanges(false))
     );
 
     get kvDB() {
         return this.plugin.kvDB;
     }
     getConflictedDoc(path: FilePathWithPrefix, rev: string) {
-        return this.plugin.localDatabase.getConflictedDoc(path, rev);
+        return this.localDatabase.managers.conflictManager.getConflictedDoc(path, rev);
     }
     onunload() {
         this.periodicInternalFileScanProcessor?.disable();
@@ -132,14 +136,19 @@ export class HiddenFileSync extends LiveSyncCommands implements IObsidianModule 
             this.updateSettingCache();
         });
     }
-    async $everyOnInitializeDatabase(db: LiveSyncLocalDB): Promise<boolean> {
+
+    // We cannot initialise autosaveCache because kvDB is not ready yet
+    // async _everyOnInitializeDatabase(db: LiveSyncLocalDB): Promise<boolean> {
+    //     this._fileInfoLastProcessed = await autosaveCache(this.kvDB, "hidden-file-lastProcessed");
+    //     this._databaseInfoLastProcessed = await autosaveCache(this.kvDB, "hidden-file-lastProcessed-database");
+    //     this._fileInfoLastKnown = await autosaveCache(this.kvDB, "hidden-file-lastKnown");
+    //     return true;
+    // }
+    private async _everyOnDatabaseInitialized(showNotice: boolean) {
         this._fileInfoLastProcessed = await autosaveCache(this.kvDB, "hidden-file-lastProcessed");
         this._databaseInfoLastProcessed = await autosaveCache(this.kvDB, "hidden-file-lastProcessed-database");
         this._fileInfoLastKnown = await autosaveCache(this.kvDB, "hidden-file-lastKnown");
-        return true;
-    }
-    async $everyOnDatabaseInitialized(showNotice: boolean) {
-        if (this._isThisModuleEnabled()) {
+        if (this.isThisModuleEnabled()) {
             if (this._fileInfoLastProcessed.size == 0 && this._fileInfoLastProcessed.size == 0) {
                 this._log(`No cache found. Performing startup scan.`, LOG_LEVEL_VERBOSE);
                 await this.performStartupScan(true);
@@ -149,9 +158,9 @@ export class HiddenFileSync extends LiveSyncCommands implements IObsidianModule 
         }
         return true;
     }
-    async $everyBeforeReplicate(showNotice: boolean) {
+    async _everyBeforeReplicate(showNotice: boolean) {
         if (
-            this._isThisModuleEnabled() &&
+            this.isThisModuleEnabled() &&
             this._isDatabaseReady() &&
             this.settings.syncInternalFilesBeforeReplication &&
             !this.settings.watchInternalFileChanges
@@ -161,79 +170,66 @@ export class HiddenFileSync extends LiveSyncCommands implements IObsidianModule 
         return true;
     }
 
-    $everyOnloadAfterLoadSettings(): Promise<boolean> {
+    private _everyOnloadAfterLoadSettings(): Promise<boolean> {
         this.updateSettingCache();
         return Promise.resolve(true);
     }
-    updateSettingCache() {
-        const ignorePatterns = getFileRegExp(this.plugin.settings, "syncInternalFilesIgnorePatterns");
-        this.ignorePatterns = ignorePatterns;
-        const targetFilter = getFileRegExp(this.plugin.settings, "syncInternalFilesTargetPatterns");
-        this.targetPatterns = targetFilter;
 
-        this.shouldSkipFile = [] as FilePathWithPrefixLC[];
-        // Exclude files handled by customization sync
-        const configDir = normalizePath(this.app.vault.configDir);
-        const shouldSKip = !this.settings.usePluginSync
-            ? []
-            : Object.values(this.settings.pluginSyncExtendedSetting)
-                  .filter((e) => e.mode == MODE_SELECTIVE || e.mode == MODE_PAUSED)
-                  .map((e) => e.files)
-                  .flat()
-                  .map((e) => `${configDir}/${e}`.toLowerCase());
-        this.shouldSkipFile = shouldSKip as FilePathWithPrefixLC[];
-        this._log(`Hidden file will skip ${this.shouldSkipFile.length} files`, LOG_LEVEL_INFO);
+    updateSettingCache() {
+        this.cacheCustomisationSyncIgnoredFiles.clear();
+        this.cacheFileRegExps.clear();
     }
 
     isReady() {
         if (!this._isMainReady) return false;
         if (this._isMainSuspended()) return false;
-        if (!this._isThisModuleEnabled()) return false;
+        if (!this.isThisModuleEnabled()) return false;
         return true;
     }
-    shouldSkipFile = [] as FilePathWithPrefixLC[];
 
     async performStartupScan(showNotice: boolean) {
         await this.applyOfflineChanges(showNotice);
     }
 
-    async $everyOnResumeProcess(): Promise<boolean> {
+    async _everyOnResumeProcess(): Promise<boolean> {
         this.periodicInternalFileScanProcessor?.disable();
         if (this._isMainSuspended()) return true;
-        if (this._isThisModuleEnabled()) {
+        if (this.isThisModuleEnabled()) {
             await this.performStartupScan(false);
         }
         this.periodicInternalFileScanProcessor.enable(
-            this._isThisModuleEnabled() && this.settings.syncInternalFilesInterval
+            this.isThisModuleEnabled() && this.settings.syncInternalFilesInterval
                 ? this.settings.syncInternalFilesInterval * 1000
                 : 0
         );
         return true;
     }
 
-    $everyRealizeSettingSyncMode(): Promise<boolean> {
+    _everyRealizeSettingSyncMode(): Promise<boolean> {
         this.periodicInternalFileScanProcessor?.disable();
         if (this._isMainSuspended()) return Promise.resolve(true);
-        if (!this.plugin.$$isReady()) return Promise.resolve(true);
+        if (!this.services.appLifecycle.isReady()) return Promise.resolve(true);
         this.periodicInternalFileScanProcessor.enable(
-            this._isThisModuleEnabled() && this.settings.syncInternalFilesInterval
+            this.isThisModuleEnabled() && this.settings.syncInternalFilesInterval
                 ? this.settings.syncInternalFilesInterval * 1000
                 : 0
         );
-        const ignorePatterns = getFileRegExp(this.plugin.settings, "syncInternalFilesIgnorePatterns");
-        this.ignorePatterns = ignorePatterns;
-        const targetFilter = getFileRegExp(this.plugin.settings, "syncInternalFilesTargetPatterns");
-        this.targetPatterns = targetFilter;
+        this.cacheFileRegExps.clear();
+        // const ignorePatterns = getFileRegExp(this.plugin.settings, "syncInternalFilesIgnorePatterns");
+        // this.ignorePatterns = ignorePatterns;
+        // const targetFilter = getFileRegExp(this.plugin.settings, "syncInternalFilesTargetPatterns");
+        // this.targetPatterns = targetFilter;
         return Promise.resolve(true);
     }
 
-    async $anyProcessOptionalFileEvent(path: FilePath): Promise<boolean | undefined> {
+    async _anyProcessOptionalFileEvent(path: FilePath): Promise<boolean> {
         if (this.isReady()) {
-            return await this.trackStorageFileModification(path);
+            return (await this.trackStorageFileModification(path)) || false;
         }
+        return false;
     }
 
-    $anyGetOptionalConflictCheckMethod(path: FilePathWithPrefix): Promise<boolean | "newer"> {
+    _anyGetOptionalConflictCheckMethod(path: FilePathWithPrefix): Promise<boolean | "newer"> {
         if (isInternalMetadata(path)) {
             this.queueConflictCheck(path);
             return Promise.resolve(true);
@@ -241,18 +237,28 @@ export class HiddenFileSync extends LiveSyncCommands implements IObsidianModule 
         return Promise.resolve(false);
     }
 
-    async $anyProcessOptionalSyncFiles(doc: LoadedEntry): Promise<boolean | undefined> {
+    async _anyProcessOptionalSyncFiles(doc: LoadedEntry): Promise<boolean> {
         if (isInternalMetadata(doc._id)) {
-            if (this._isThisModuleEnabled()) {
+            if (this.isThisModuleEnabled()) {
                 //system file
-                const filename = getPath(doc);
-                if (await this.plugin.$$isTargetFile(filename)) {
-                    // this.procInternalFile(filename);
-                    await this.processReplicationResult(doc);
+                const filename = this.getPath(doc);
+                const unprefixedPath = stripAllPrefixes(filename);
+                // No need to check via vaultService
+                // if (!await this.services.vault.isTargetFile(unprefixedPath)) {
+                //     this._log(`Skipped processing sync file:${unprefixedPath} (Not target)`, LOG_LEVEL_VERBOSE);
+                //     return true;
+                // }
+                if (!(await this.isTargetFile(stripAllPrefixes(unprefixedPath)))) {
+                    this._log(
+                        `Skipped processing sync file:${unprefixedPath} (Not Hidden File Sync target)`,
+                        LOG_LEVEL_VERBOSE
+                    );
+                    // We should return true, we made sure that document is a internalMetadata.
                     return true;
-                } else {
-                    this._log(`Skipped (Not target:${filename})`, LOG_LEVEL_VERBOSE);
-                    return false;
+                }
+                if (!(await this.processReplicationResult(doc))) {
+                    this._log(`Failed to process sync file:${unprefixedPath}`, LOG_LEVEL_NOTICE);
+                    // Do not yield false, this file had been processed.
                 }
             }
             return true;
@@ -354,13 +360,13 @@ export class HiddenFileSync extends LiveSyncCommands implements IObsidianModule 
         const dbMTime = getComparingMTime(db);
         const storageMTime = getComparingMTime(stat);
         if (dbMTime == 0 || storageMTime == 0) {
-            unmarkChanges(path);
+            this.services.path.unmarkChanges(path);
         } else {
-            markChangesAreSame(path, getComparingMTime(db), getComparingMTime(stat));
+            this.services.path.markChangesAreSame(path, getComparingMTime(db), getComparingMTime(stat));
         }
     }
     updateLastProcessedDeletion(path: FilePath, db: MetaEntry | LoadedEntry | false) {
-        unmarkChanges(path);
+        this.services.path.unmarkChanges(path);
         if (db) this.updateLastProcessedDatabase(path, db);
         this.updateLastProcessedFile(path, this.statToKey(null));
     }
@@ -545,8 +551,11 @@ Offline Changed files: ${processFiles.length}`;
         forceWrite = false,
         includeDeleted = true
     ): Promise<boolean | undefined> {
-        if (this.shouldSkipFile.some((e) => e.startsWith(path.toLowerCase()))) {
-            this._log(`Hidden file skipped: ${path} is synchronized in customization sync.`, LOG_LEVEL_VERBOSE);
+        if (!(await this.isTargetFile(path))) {
+            this._log(
+                `Storage file tracking: Hidden file skipped: ${path} is filtered out by the defined patterns.`,
+                LOG_LEVEL_VERBOSE
+            );
             return false;
         }
         try {
@@ -699,7 +708,7 @@ Offline Changed files: ${processFiles.length}`;
                         revFrom._revs_info
                             ?.filter((e) => e.status == "available" && Number(e.rev.split("-")[0]) < conflictedRevNo)
                             .first()?.rev ?? "";
-                    const result = await this.plugin.localDatabase.mergeObject(
+                    const result = await this.localDatabase.managers.conflictManager.mergeObject(
                         doc.path,
                         commonBase,
                         doc._rev,
@@ -720,6 +729,13 @@ Offline Changed files: ${processFiles.length}`;
                         return [];
                     } else {
                         this._log(`Object merge is not applicable.`, LOG_LEVEL_VERBOSE);
+                    }
+                    // const pat = this.settings.syncInternalFileOverwritePatterns;
+                    const regExp = getFileRegExp(this.settings, "syncInternalFileOverwritePatterns");
+                    if (regExp.some((r) => r.test(stripAllPrefixes(path)))) {
+                        this._log(`Overwrite rule applied for conflicted hidden file: ${path}`, LOG_LEVEL_INFO);
+                        await this.resolveByNewerEntry(id, path, doc, revA, revB);
+                        return [];
                     }
                     return [{ path, revA, revB, id, doc }];
                 }
@@ -835,9 +851,32 @@ Offline Changed files: ${processFiles.length}`;
     // <-- Conflict processing
 
     // --> Event Source Handler (Database)
-
+    getDocProps(doc: LoadedEntry) {
+        /*
+            type DocumentProps = {
+                id: DocumentID;
+                rev?: string;
+                prefixedPath: FilePathWithPrefix;
+                path: FilePath;
+                isDeleted: boolean;
+                revDisplay: string;
+                shortenedId: string;
+                shortenedPath: string;
+            };
+        */
+        const id = doc._id;
+        const shortenedId = id.substring(0, 10);
+        const prefixedPath = this.getPath(doc);
+        const path = stripAllPrefixes(prefixedPath);
+        const rev = doc._rev;
+        const revDisplay = rev ? displayRev(rev) : "0-NOREVS";
+        // const prefix = prefixedPath.substring(0, prefixedPath.length - path.length);
+        const shortenedPath = path.substring(0, 10);
+        const isDeleted = doc._deleted || doc.deleted || false;
+        return { id, rev, revDisplay, prefixedPath, path, isDeleted, shortenedId, shortenedPath };
+    }
     async processReplicationResult(doc: LoadedEntry): Promise<boolean> {
-        const info = getDocProps(doc);
+        const info = this.getDocProps(doc);
         const path = info.path;
         const headerLine = `Tracking DB ${info.path} (${info.revDisplay}) :`;
         const ret = await this.trackDatabaseFileModification(path, headerLine);
@@ -848,6 +887,108 @@ Offline Changed files: ${processFiles.length}`;
     // <-- Event Source Handler (Database)
 
     // --> Database Event Functions
+
+    cacheFileRegExps = new Map<string, CustomRegExp[][]>();
+    /**
+     * Parses the regular expression settings for hidden file synchronization.
+     * @returns An object containing the ignore and target filters.
+     */
+    parseRegExpSettings() {
+        const regExpKey = `${this.plugin.settings.syncInternalFilesTargetPatterns}||${this.plugin.settings.syncInternalFilesIgnorePatterns}`;
+        let ignoreFilter: CustomRegExp[];
+        let targetFilter: CustomRegExp[];
+        if (this.cacheFileRegExps.has(regExpKey)) {
+            const cached = this.cacheFileRegExps.get(regExpKey)!;
+            ignoreFilter = cached[1];
+            targetFilter = cached[0];
+        } else {
+            ignoreFilter = getFileRegExp(this.plugin.settings, "syncInternalFilesIgnorePatterns");
+            targetFilter = getFileRegExp(this.plugin.settings, "syncInternalFilesTargetPatterns");
+            this.cacheFileRegExps.clear();
+            this.cacheFileRegExps.set(regExpKey, [targetFilter, ignoreFilter]);
+        }
+        return { ignoreFilter, targetFilter };
+    }
+
+    /**
+     * Checks if the target file path matches the defined patterns.
+     */
+    isTargetFileInPatterns(path: string): boolean {
+        const { ignoreFilter, targetFilter } = this.parseRegExpSettings();
+
+        if (ignoreFilter && ignoreFilter.length > 0) {
+            for (const pattern of ignoreFilter) {
+                if (pattern.test(path)) {
+                    return false;
+                }
+            }
+        }
+        if (targetFilter && targetFilter.length > 0) {
+            for (const pattern of targetFilter) {
+                if (pattern.test(path)) {
+                    return true;
+                }
+            }
+            // While having target patterns, it effects as an allow-list.
+            return false;
+        }
+        return true;
+    }
+
+    cacheCustomisationSyncIgnoredFiles = new Map<string, string[]>();
+    /**
+     * Gets the list of files ignored for customization synchronization.
+     * @returns An array of ignored file paths (lowercase).
+     */
+    getCustomisationSynchronizationIgnoredFiles(): string[] {
+        const configDir = this.plugin.app.vault.configDir;
+        const key =
+            JSON.stringify(this.settings.pluginSyncExtendedSetting) + `||${this.settings.usePluginSync}||${configDir}`;
+        if (this.cacheCustomisationSyncIgnoredFiles.has(key)) {
+            return this.cacheCustomisationSyncIgnoredFiles.get(key)!;
+        }
+        this.cacheCustomisationSyncIgnoredFiles.clear();
+        const synchronisedInConfigSync = !this.settings.usePluginSync
+            ? []
+            : Object.values(this.settings.pluginSyncExtendedSetting)
+                  .filter((e) => e.mode == MODE_SELECTIVE || e.mode == MODE_PAUSED)
+                  .map((e) => e.files)
+                  .flat()
+                  .map((e) => `${configDir}/${e}`.toLowerCase());
+        this.cacheCustomisationSyncIgnoredFiles.set(key, synchronisedInConfigSync);
+        return synchronisedInConfigSync;
+    }
+    /**
+     * Checks if the given path is not ignored by customization synchronization.
+     * @param path The file path to check.
+     * @returns True if the path is not ignored; otherwise, false.
+     */
+    isNotIgnoredByCustomisationSync(path: string): boolean {
+        const ignoredFiles = this.getCustomisationSynchronizationIgnoredFiles();
+        const result = !ignoredFiles.some((e) => path.startsWith(e));
+        // console.warn(`Assertion: isNotIgnoredByCustomisationSync(${path}) = ${result}`);
+        return result;
+    }
+
+    isHiddenFileSyncHandlingPath(path: FilePath): boolean {
+        const result = path.startsWith(".") && !path.startsWith(".trash");
+        // console.warn(`Assertion: isHiddenFileSyncHandlingPath(${path}) = ${result}`);
+        return result;
+    }
+
+    async isTargetFile(path: FilePath): Promise<boolean> {
+        const result =
+            this.isTargetFileInPatterns(path) &&
+            this.isNotIgnoredByCustomisationSync(path) &&
+            this.isHiddenFileSyncHandlingPath(path);
+        // console.warn(`Assertion: isTargetFile(${path}) : ${result ? "✔️" : "❌"}`);
+        if (!result) {
+            return false;
+        }
+        const resultByFile = await this.services.vault.isIgnoredByIgnoreFile(path);
+        // console.warn(`${path}  -> isIgnoredByIgnoreFile: ${resultByFile ? "❌" : "✔️"}`);
+        return !resultByFile;
+    }
 
     async trackScannedDatabaseChange(
         processFiles: MetaEntry[],
@@ -862,14 +1003,21 @@ Offline Changed files: ${processFiles.length}`;
         const processes = processFiles.map(async (file) => {
             try {
                 const path = stripAllPrefixes(this.getPath(file));
-                await this.trackDatabaseFileModification(
-                    path,
-                    "[Hidden file scan]",
-                    !forceWriteAll,
-                    onlyNew,
-                    file,
-                    includeDeletion
-                );
+                if (!(await this.isTargetFile(path))) {
+                    this._log(
+                        `Database file tracking: Hidden file skipped: ${path} is filtered out by the defined patterns.`,
+                        LOG_LEVEL_VERBOSE
+                    );
+                } else {
+                    await this.trackDatabaseFileModification(
+                        path,
+                        "[Hidden file scan]",
+                        !forceWriteAll,
+                        onlyNew,
+                        file,
+                        includeDeletion
+                    );
+                }
                 notifyProgress();
             } catch (ex) {
                 this._log(`Failed to process storage change file:${file}`, logLevel);
@@ -890,7 +1038,7 @@ Offline Changed files: ${processFiles.length}`;
             p.log("Enumerating database files...");
             const currentDatabaseFiles = await this.getAllDatabaseFiles();
             const allDatabaseMap = Object.fromEntries(
-                currentDatabaseFiles.map((e) => [stripAllPrefixes(getPath(e)), e])
+                currentDatabaseFiles.map((e) => [stripAllPrefixes(this.getPath(e)), e])
             );
             const currentDatabaseFileNames = [...Object.keys(allDatabaseMap)] as FilePath[];
             const untrackedLocal = currentStorageFiles.filter((e) => !this._fileInfoLastProcessed.has(e));
@@ -1091,14 +1239,14 @@ Offline Changed files: ${files.length}`;
 
         // If something changes left, notify for reloading Obsidian.
         if (updatedFolders.indexOf(this.plugin.app.vault.configDir) >= 0) {
-            if (!this.plugin.$$isReloadingScheduled()) {
+            if (!this.services.appLifecycle.isReloadingScheduled()) {
                 this.plugin.confirm.askInPopup(
                     `updated-any-hidden`,
                     `Some setting files have been modified\nPress {HERE} to schedule a reload of Obsidian, or press elsewhere to dismiss this message.`,
                     (anchor) => {
                         anchor.text = "HERE";
                         anchor.addEventListener("click", () => {
-                            this.plugin.$$scheduleAppReload();
+                            this.services.appLifecycle.scheduleRestart();
                         });
                     }
                 );
@@ -1133,14 +1281,14 @@ Offline Changed files: ${files.length}`;
             : currentStorageFilesAll;
         p.log("Enumerating database files...");
         const allDatabaseFiles = await this.getAllDatabaseFiles();
-        const allDatabaseMap = new Map(allDatabaseFiles.map((e) => [stripAllPrefixes(getPath(e)), e]));
+        const allDatabaseMap = new Map(allDatabaseFiles.map((e) => [stripAllPrefixes(this.getPath(e)), e]));
         const currentDatabaseFiles = targetFiles
-            ? allDatabaseFiles.filter((e) => targetFiles.some((f) => f == stripAllPrefixes(getPath(e))))
+            ? allDatabaseFiles.filter((e) => targetFiles.some((f) => f == stripAllPrefixes(this.getPath(e))))
             : allDatabaseFiles;
 
         const allFileNames = new Set([
             ...currentStorageFiles,
-            ...currentDatabaseFiles.map((e) => stripAllPrefixes(getPath(e))),
+            ...currentDatabaseFiles.map((e) => stripAllPrefixes(this.getPath(e))),
         ]);
         const storageToDatabase = [] as FilePath[];
         const databaseToStorage = [] as MetaEntry[];
@@ -1202,7 +1350,13 @@ Offline Changed files: ${files.length}`;
         ).rows
             .filter((e) => isInternalMetadata(e.id as DocumentID))
             .map((e) => e.doc) as MetaEntry[];
-        return allFiles;
+        const files = [] as MetaEntry[];
+        for (const file of allFiles) {
+            if (await this.isTargetFile(stripAllPrefixes(this.getPath(file)))) {
+                files.push(file);
+            }
+        }
+        return files;
     }
 
     async rebuildFromDatabase(showNotice: boolean, targetFiles: FilePath[] | false = false, onlyNew = false) {
@@ -1217,7 +1371,7 @@ Offline Changed files: ${files.length}`;
         // However, in perspective of performance and future-proofing, I feel somewhat justified in doing it here.
 
         const currentFiles = targetFiles
-            ? allFiles.filter((e) => targetFiles.some((f) => f == stripAllPrefixes(getPath(e))))
+            ? allFiles.filter((e) => targetFiles.some((f) => f == stripAllPrefixes(this.getPath(e))))
             : allFiles;
 
         p.once(`Database to Storage: ${currentFiles.length} files.`);
@@ -1260,7 +1414,7 @@ Offline Changed files: ${files.length}`;
             const onlyNew = direction == "pull";
             p.log(`Started: Database --> Storage ${onlyNew ? "(Only New)" : ""}`);
             const updatedEntries = await this.rebuildFromDatabase(showMessage, targetFiles, onlyNew);
-            const updatedFiles = updatedEntries.map((e) => stripAllPrefixes(getPath(e)));
+            const updatedFiles = updatedEntries.map((e) => stripAllPrefixes(this.getPath(e)));
             // making doubly sure, No more losing files.
             await this.adoptCurrentStorageFilesAsProcessed(updatedFiles);
             await this.adoptCurrentDatabaseFilesAsProcessed(updatedFiles);
@@ -1318,7 +1472,7 @@ Offline Changed files: ${files.length}`;
     async storeInternalFileToDatabase(file: InternalFileInfo | UXFileInfo, forceWrite = false) {
         const storeFilePath = stripAllPrefixes(file.path as FilePath);
         const storageFilePath = file.path;
-        if (await this.plugin.$$isIgnoredByIgnoreFiles(storageFilePath)) {
+        if (await this.services.vault.isIgnoredByIgnoreFile(storageFilePath)) {
             return undefined;
         }
         const prefixedFileName = addPrefix(storeFilePath, ICHeader);
@@ -1372,7 +1526,7 @@ Offline Changed files: ${files.length}`;
         const displayFileName = filenameSrc;
         const prefixedFileName = addPrefix(storeFilePath, ICHeader);
         const mtime = new Date().getTime();
-        if (await this.plugin.$$isIgnoredByIgnoreFiles(storageFilePath)) {
+        if (await this.services.vault.isIgnoredByIgnoreFile(storageFilePath)) {
             return undefined;
         }
         return await serialized("file-" + prefixedFileName, async () => {
@@ -1432,7 +1586,7 @@ Offline Changed files: ${files.length}`;
         includeDeletion = true
     ) {
         const prefixedFileName = addPrefix(storageFilePath, ICHeader);
-        if (await this.plugin.$$isIgnoredByIgnoreFiles(storageFilePath)) {
+        if (await this.services.vault.isIgnoredByIgnoreFile(storageFilePath)) {
             return undefined;
         }
         return await serialized("file-" + prefixedFileName, async () => {
@@ -1479,7 +1633,7 @@ Offline Changed files: ${files.length}`;
                 }
                 const deleted = metaOnDB.deleted || metaOnDB._deleted || false;
                 if (deleted) {
-                    const result = await this._deleteFile(storageFilePath);
+                    const result = await this.__deleteFile(storageFilePath);
                     if (result == "OK") {
                         this.updateLastProcessedDeletion(storageFilePath, metaOnDB);
                         return true;
@@ -1493,7 +1647,7 @@ Offline Changed files: ${files.length}`;
                     if (fileOnDB === false) {
                         throw new Error(`Failed to read file from database:${storageFilePath}`);
                     }
-                    const resultStat = await this._writeFile(storageFilePath, fileOnDB, force);
+                    const resultStat = await this.__writeFile(storageFilePath, fileOnDB, force);
                     if (resultStat) {
                         this.updateLastProcessed(storageFilePath, metaOnDB, resultStat);
                         this.queueNotification(storageFilePath);
@@ -1526,7 +1680,7 @@ Offline Changed files: ${files.length}`;
         }
     }
 
-    async _writeFile(storageFilePath: FilePath, fileOnDB: LoadedEntry, force: boolean): Promise<false | UXStat> {
+    async __writeFile(storageFilePath: FilePath, fileOnDB: LoadedEntry, force: boolean): Promise<false | UXStat> {
         try {
             const statBefore = await this.plugin.storageAccess.statHidden(storageFilePath);
             const isExist = statBefore != null;
@@ -1565,7 +1719,7 @@ Offline Changed files: ${files.length}`;
         }
     }
 
-    async _deleteFile(storageFilePath: FilePath): Promise<false | "OK" | "ALREADY"> {
+    async __deleteFile(storageFilePath: FilePath): Promise<false | "OK" | "ALREADY"> {
         const result = await this.__removeFile(storageFilePath);
         if (result === false) {
             this._log(`STORAGE <x- DB: ${storageFilePath}: deleting (hidden) Failed`);
@@ -1582,11 +1736,11 @@ Offline Changed files: ${files.length}`;
 
     // <-- Database To Storage Functions
 
-    async $allAskUsingOptionalSyncFeature(opt: { enableFetch?: boolean; enableOverwrite?: boolean }) {
-        await this._askHiddenFileConfiguration(opt);
+    private async _allAskUsingOptionalSyncFeature(opt: { enableFetch?: boolean; enableOverwrite?: boolean }) {
+        await this.__askHiddenFileConfiguration(opt);
         return true;
     }
-    async _askHiddenFileConfiguration(opt: { enableFetch?: boolean; enableOverwrite?: boolean }) {
+    private async __askHiddenFileConfiguration(opt: { enableFetch?: boolean; enableOverwrite?: boolean }) {
         const messageFetch = `${opt.enableFetch ? `> - Fetch: Use the files stored from other devices. Choose this option if you have already configured hidden file synchronization on those devices and wish to accept their files.\n` : ""}`;
         const messageOverwrite = `${opt.enableOverwrite ? `> - Overwrite: Use the files from this device. Select this option if you want to overwrite the files stored on other devices.\n` : ""}`;
         const messageMerge = `> - Merge: Merge the files from this device with those on other devices. Choose this option if you wish to combine files from multiple sources.
@@ -1632,7 +1786,7 @@ ${messageFetch}${messageOverwrite}${messageMerge}
         }
     }
 
-    $allSuspendExtraSync(): Promise<boolean> {
+    private _allSuspendExtraSync(): Promise<boolean> {
         if (this.plugin.settings.syncInternalFiles) {
             this._log(
                 "Hidden file synchronization have been temporarily disabled. Please enable them after the fetching, if you need them.",
@@ -1644,11 +1798,12 @@ ${messageFetch}${messageOverwrite}${messageMerge}
     }
 
     // --> Configuration handling
-    async $anyConfigureOptionalSyncFeature(mode: "FETCH" | "OVERWRITE" | "MERGE" | "DISABLE" | "DISABLE_HIDDEN") {
+    private async _allConfigureOptionalSyncFeature(mode: keyof OPTIONAL_SYNC_FEATURES) {
         await this.configureHiddenFileSync(mode);
+        return true;
     }
 
-    async configureHiddenFileSync(mode: "FETCH" | "OVERWRITE" | "MERGE" | "DISABLE" | "DISABLE_HIDDEN") {
+    async configureHiddenFileSync(mode: keyof OPTIONAL_SYNC_FEATURES) {
         if (
             mode != "FETCH" &&
             mode != "OVERWRITE" &&
@@ -1682,29 +1837,13 @@ ${messageFetch}${messageOverwrite}${messageMerge}
     // <-- Configuration handling
 
     // --> Local Storage SubFunctions
-    ignorePatterns: CustomRegExp[] = [];
-    targetPatterns: CustomRegExp[] = [];
     async scanInternalFileNames() {
-        const configDir = normalizePath(this.app.vault.configDir);
-        const ignoreFilter = getFileRegExp(this.plugin.settings, "syncInternalFilesIgnorePatterns");
-        const targetFilter = getFileRegExp(this.plugin.settings, "syncInternalFilesTargetPatterns");
-        const synchronisedInConfigSync = !this.settings.usePluginSync
-            ? []
-            : Object.values(this.settings.pluginSyncExtendedSetting)
-                  .filter((e) => e.mode == MODE_SELECTIVE || e.mode == MODE_PAUSED)
-                  .map((e) => e.files)
-                  .flat()
-                  .map((e) => `${configDir}/${e}`.toLowerCase());
         const root = this.app.vault.getRoot();
         const findRoot = root.path;
 
-        const filenames = (await this.getFiles(findRoot, [], targetFilter, ignoreFilter))
-            .filter((e) => e.startsWith("."))
-            .filter((e) => !e.startsWith(".trash"));
-        const files = filenames.filter((path) =>
-            synchronisedInConfigSync.every((filterFile) => !path.toLowerCase().startsWith(filterFile))
-        );
-        return files as FilePath[];
+        const filenames = await this.getFiles(findRoot, (path) => this.isTargetFile(path));
+
+        return filenames as FilePath[];
     }
 
     async scanInternalFiles(): Promise<InternalFileInfo[]> {
@@ -1718,7 +1857,7 @@ ${messageFetch}${messageOverwrite}${messageMerge}
         const result: InternalFileInfo[] = [];
         for (const f of files) {
             const w = await f;
-            if (await this.plugin.$$isIgnoredByIgnoreFiles(w.path)) {
+            if (await this.services.vault.isIgnoredByIgnoreFile(w.path)) {
                 continue;
             }
             const mtime = w.stat?.mtime ?? 0;
@@ -1734,7 +1873,32 @@ ${messageFetch}${messageOverwrite}${messageMerge}
         return result;
     }
 
-    async getFiles(path: string, ignoreList: string[], filter?: CustomRegExp[], ignoreFilter?: CustomRegExp[]) {
+    async getFiles(path: string, checkFunction: (path: FilePath) => Promise<boolean> | boolean) {
+        let w: ListedFiles;
+        try {
+            w = await this.app.vault.adapter.list(path);
+        } catch (ex) {
+            this._log(`Could not traverse(HiddenSync):${path}`, LOG_LEVEL_INFO);
+            this._log(ex, LOG_LEVEL_VERBOSE);
+            return [];
+        }
+        let files = [] as string[];
+        for (const file of w.files) {
+            if (!(await checkFunction(file as FilePath))) {
+                continue;
+            }
+            files.push(file);
+        }
+        for (const v of w.folders) {
+            if (!(await checkFunction(v as FilePath))) {
+                continue;
+            }
+            files = files.concat(await this.getFiles(v, checkFunction));
+        }
+        return files;
+    }
+    /*
+    async getFiles_(path: string, ignoreList: string[], filter?: CustomRegExp[], ignoreFilter?: CustomRegExp[]) {
         let w: ListedFiles;
         try {
             w = await this.app.vault.adapter.list(path);
@@ -1756,7 +1920,7 @@ ${messageFetch}${messageOverwrite}${messageMerge}
             if (ignoreFilter && ignoreFilter.some((ee) => ee.test(file))) {
                 continue;
             }
-            if (await this.plugin.$$isIgnoredByIgnoreFiles(file)) continue;
+            if (await this.services.vault.isIgnoredByIgnoreFile(file)) continue;
             files.push(file);
         }
         L1: for (const v of w.folders) {
@@ -1765,19 +1929,32 @@ ${messageFetch}${messageOverwrite}${messageMerge}
                     continue L1;
                 }
             }
-            if (
-                ignoreFilter &&
-                ignoreFilter.some((e) => (e.pattern.startsWith("/") || e.pattern.startsWith("\\/")) && e.test(v))
-            ) {
+            if (ignoreFilter && ignoreFilter.some((e) => e.test(v))) {
                 continue L1;
             }
-            if (await this.plugin.$$isIgnoredByIgnoreFiles(v)) {
+            if (await this.services.vault.isIgnoredByIgnoreFile(v)) {
                 continue L1;
             }
-            files = files.concat(await this.getFiles(v, ignoreList, filter, ignoreFilter));
+            files = files.concat(await this.getFiles_(v, ignoreList, filter, ignoreFilter));
         }
         return files;
     }
-
+    */
     // <-- Local Storage SubFunctions
+
+    override onBindFunction(core: LiveSyncCore, services: typeof core.services) {
+        // No longer needed on initialisation
+        // services.databaseEvents.handleOnDatabaseInitialisation(this._everyOnInitializeDatabase.bind(this));
+        services.appLifecycle.onSettingLoaded.addHandler(this._everyOnloadAfterLoadSettings.bind(this));
+        services.fileProcessing.processOptionalFileEvent.addHandler(this._anyProcessOptionalFileEvent.bind(this));
+        services.conflict.getOptionalConflictCheckMethod.addHandler(this._anyGetOptionalConflictCheckMethod.bind(this));
+        services.replication.processOptionalSynchroniseResult.addHandler(this._anyProcessOptionalSyncFiles.bind(this));
+        services.setting.onRealiseSetting.addHandler(this._everyRealizeSettingSyncMode.bind(this));
+        services.appLifecycle.onResuming.addHandler(this._everyOnResumeProcess.bind(this));
+        services.replication.onBeforeReplicate.addHandler(this._everyBeforeReplicate.bind(this));
+        services.databaseEvents.onDatabaseInitialised.addHandler(this._everyOnDatabaseInitialized.bind(this));
+        services.setting.suspendExtraSync.addHandler(this._allSuspendExtraSync.bind(this));
+        services.setting.suggestOptionalFeatures.addHandler(this._allAskUsingOptionalSyncFeature.bind(this));
+        services.setting.enableOptionalFeature.addHandler(this._allConfigureOptionalSyncFeature.bind(this));
+    }
 }

@@ -1,97 +1,105 @@
-import { fireAndForget, yieldMicrotask } from "octagonal-wheels/promises";
-import type { LiveSyncLocalDB } from "../../lib/src/pouchdb/LiveSyncLocalDB";
+import { fireAndForget } from "octagonal-wheels/promises";
 import { AbstractModule } from "../AbstractModule";
-import type { ICoreModule } from "../ModuleTypes";
-import { Logger, LOG_LEVEL_NOTICE, LOG_LEVEL_INFO, LOG_LEVEL_VERBOSE } from "octagonal-wheels/common/logger";
-import { isLockAcquired, shareRunningResult, skipIfDuplicated } from "octagonal-wheels/concurrency/lock";
-import { purgeUnreferencedChunks, balanceChunkPurgedDBs } from "../../lib/src/pouchdb/utils_couchdb";
+import { Logger, LOG_LEVEL_NOTICE, LOG_LEVEL_INFO } from "octagonal-wheels/common/logger";
+import { skipIfDuplicated } from "octagonal-wheels/concurrency/lock";
+import { balanceChunkPurgedDBs } from "@lib/pouchdb/chunks";
+import { purgeUnreferencedChunks } from "@lib/pouchdb/chunks";
 import { LiveSyncCouchDBReplicator } from "../../lib/src/replication/couchdb/LiveSyncReplicator";
-import { throttle } from "octagonal-wheels/function";
-import { arrayToChunkedArray } from "octagonal-wheels/collection";
-import {
-    SYNCINFO_ID,
-    VER,
-    type EntryBody,
-    type EntryDoc,
-    type EntryLeaf,
-    type LoadedEntry,
-    type MetaEntry,
-} from "../../lib/src/common/types";
-import { QueueProcessor } from "octagonal-wheels/concurrency/processor";
-import {
-    getPath,
-    isChunk,
-    isValidPath,
-    rateLimitedSharedExecution,
-    scheduleTask,
-    updatePreviousExecutionTime,
-} from "../../common/utils";
-import { isAnyNote } from "../../lib/src/common/utils";
+import { type EntryDoc, type RemoteType } from "../../lib/src/common/types";
+import { scheduleTask } from "../../common/utils";
 import { EVENT_FILE_SAVED, EVENT_SETTING_SAVED, eventHub } from "../../common/events";
-import type { LiveSyncAbstractReplicator } from "../../lib/src/replication/LiveSyncAbstractReplicator";
-import { globalSlipBoard } from "../../lib/src/bureau/bureau";
+
 import { $msg } from "../../lib/src/common/i18n";
+import type { LiveSyncCore } from "../../main";
+import { ReplicateResultProcessor } from "./ReplicateResultProcessor";
+import { UnresolvedErrorManager } from "@lib/services/base/UnresolvedErrorManager";
+import { clearHandlers } from "@lib/replication/SyncParamsHandler";
+import type { NecessaryServices } from "@lib/interfaces/ServiceModule";
+import { MARK_LOG_NETWORK_ERROR } from "@lib/services/lib/logUtils";
 
-const KEY_REPLICATION_ON_EVENT = "replicationOnEvent";
-const REPLICATION_ON_EVENT_FORECASTED_TIME = 5000;
+function isOnlineAndCanReplicate(
+    errorManager: UnresolvedErrorManager,
+    host: NecessaryServices<"API", any>,
+    showMessage: boolean
+): Promise<boolean> {
+    const errorMessage = "Network is offline";
+    if (!host.services.API.isOnline) {
+        errorManager.showError(errorMessage, showMessage ? LOG_LEVEL_NOTICE : LOG_LEVEL_INFO);
+        return Promise.resolve(false);
+    }
+    errorManager.clearError(errorMessage);
+    return Promise.resolve(true);
+}
+async function canReplicateWithPBKDF2(
+    errorManager: UnresolvedErrorManager,
+    host: NecessaryServices<"replicator" | "setting", any>,
+    showMessage: boolean
+): Promise<boolean> {
+    const currentSettings = host.services.setting.currentSettings();
+    // TODO: check using PBKDF2 salt?
+    const errorMessage = $msg("Replicator.Message.InitialiseFatalError");
+    const replicator = host.services.replicator.getActiveReplicator();
+    if (!replicator) {
+        errorManager.showError(errorMessage, showMessage ? LOG_LEVEL_NOTICE : LOG_LEVEL_INFO);
+        return false;
+    }
+    errorManager.clearError(errorMessage);
+    // Showing message is false: that because be shown here. (And it is a fatal error, no way to hide it).
+    // tagged as network error at beginning for error filtering with NetworkWarningStyles
+    const ensureMessage = `${MARK_LOG_NETWORK_ERROR}Failed to initialise the encryption key, preventing replication.`;
+    const ensureResult = await replicator.ensurePBKDF2Salt(currentSettings, showMessage, true);
+    if (!ensureResult) {
+        errorManager.showError(ensureMessage, showMessage ? LOG_LEVEL_NOTICE : LOG_LEVEL_INFO);
+        return false;
+    }
+    errorManager.clearError(ensureMessage);
+    return ensureResult; // is true.
+}
 
-export class ModuleReplicator extends AbstractModule implements ICoreModule {
-    _replicatorType?: string;
-    $everyOnloadAfterLoadSettings(): Promise<boolean> {
+export class ModuleReplicator extends AbstractModule {
+    _replicatorType?: RemoteType;
+
+    processor: ReplicateResultProcessor = new ReplicateResultProcessor(this);
+    private _unresolvedErrorManager: UnresolvedErrorManager = new UnresolvedErrorManager(
+        this.core.services.appLifecycle
+    );
+
+    clearErrors() {
+        this._unresolvedErrorManager.clearErrors();
+    }
+
+    private _everyOnloadAfterLoadSettings(): Promise<boolean> {
         eventHub.onEvent(EVENT_FILE_SAVED, () => {
-            if (this.settings.syncOnSave && !this.core.$$isSuspended()) {
-                scheduleTask("perform-replicate-after-save", 250, () => this.core.$$replicateByEvent());
+            if (this.settings.syncOnSave && !this.core.services.appLifecycle.isSuspended()) {
+                scheduleTask("perform-replicate-after-save", 250, () => this.services.replication.replicateByEvent());
             }
         });
         eventHub.onEvent(EVENT_SETTING_SAVED, (setting) => {
-            if (this._replicatorType !== setting.remoteType) {
-                void this.setReplicator();
+            if (this.core.settings.suspendParseReplicationResult) {
+                this.processor.suspend();
+            } else {
+                this.processor.resume();
             }
         });
 
         return Promise.resolve(true);
     }
 
-    async setReplicator() {
-        const replicator = await this.core.$anyNewReplicator();
-        if (!replicator) {
-            this._log($msg("Replicator.Message.InitialiseFatalError"), LOG_LEVEL_NOTICE);
-            return false;
-        }
-        if (this.core.replicator) {
-            await this.core.replicator.closeReplication();
-            this._log("Replicator closed for changing", LOG_LEVEL_VERBOSE);
-        }
-        this.core.replicator = replicator;
-        this._replicatorType = this.settings.remoteType;
-        await yieldMicrotask();
+    _onReplicatorInitialised(): Promise<boolean> {
+        // For now, we only need to clear the error related to replicator initialisation, but in the future, if there are more things to do when the replicator is initialised, we can add them here.
+        clearHandlers();
+        return Promise.resolve(true);
+    }
+
+    _everyOnDatabaseInitialized(showNotice: boolean): Promise<boolean> {
+        fireAndForget(() => this.processor.restoreFromSnapshotOnce());
+        return Promise.resolve(true);
+    }
+
+    async _everyBeforeReplicate(showMessage: boolean): Promise<boolean> {
+        await this.processor.restoreFromSnapshotOnce();
+        this.clearErrors();
         return true;
-    }
-
-    $$getReplicator(): LiveSyncAbstractReplicator {
-        return this.core.replicator;
-    }
-
-    $everyOnInitializeDatabase(db: LiveSyncLocalDB): Promise<boolean> {
-        return this.setReplicator();
-    }
-
-    $everyOnResetDatabase(db: LiveSyncLocalDB): Promise<boolean> {
-        return this.setReplicator();
-    }
-
-    async $everyBeforeReplicate(showMessage: boolean): Promise<boolean> {
-        await this.loadQueuedFiles();
-        return true;
-    }
-
-    async $$replicate(showMessage: boolean = false): Promise<boolean | void> {
-        try {
-            updatePreviousExecutionTime(KEY_REPLICATION_ON_EVENT, REPLICATION_ON_EVENT_FORECASTED_TIME);
-            return await this.$$_replicate(showMessage);
-        } finally {
-            updatePreviousExecutionTime(KEY_REPLICATION_ON_EVENT);
-        }
     }
 
     /**
@@ -122,11 +130,11 @@ Even if you choose to clean up, you will see this option again if you exit Obsid
                 await this.core.rebuilder.$performRebuildDB("localOnly");
             }
             if (ret == CHOICE_CLEAN) {
-                const replicator = this.core.$$getReplicator();
+                const replicator = this.services.replicator.getActiveReplicator();
                 if (!(replicator instanceof LiveSyncCouchDBReplicator)) return;
                 const remoteDB = await replicator.connectRemoteCouchDBWithSetting(
                     this.settings,
-                    this.core.$$isMobile(),
+                    this.services.API.isMobile(),
                     true
                 );
                 if (typeof remoteDB == "string") {
@@ -135,13 +143,13 @@ Even if you choose to clean up, you will see this option again if you exit Obsid
                 }
 
                 await purgeUnreferencedChunks(this.localDatabase.localDatabase, false);
-                this.localDatabase.hashCaches.clear();
+                this.localDatabase.clearCaches();
                 // Perform the synchronisation once.
                 if (await this.core.replicator.openReplication(this.settings, false, showMessage, true)) {
                     await balanceChunkPurgedDBs(this.localDatabase.localDatabase, remoteDB.db);
                     await purgeUnreferencedChunks(this.localDatabase.localDatabase, false);
-                    this.localDatabase.hashCaches.clear();
-                    await this.core.$$getReplicator().markRemoteResolved(this.settings);
+                    this.localDatabase.clearCaches();
+                    await this.services.replicator.getActiveReplicator()?.markRemoteResolved(this.settings);
                     Logger("The local database has been cleaned up.", showMessage ? LOG_LEVEL_NOTICE : LOG_LEVEL_INFO);
                 } else {
                     Logger(
@@ -152,297 +160,130 @@ Even if you choose to clean up, you will see this option again if you exit Obsid
             }
         });
     }
-    async $$_replicate(showMessage: boolean = false): Promise<boolean | void> {
-        //--?
-        if (!this.core.$$isReady()) return;
-        if (isLockAcquired("cleanup")) {
-            Logger($msg("Replicator.Message.Cleaned"), LOG_LEVEL_NOTICE);
-            return;
-        }
-        if (this.settings.versionUpFlash != "") {
-            Logger($msg("Replicator.Message.VersionUpFlash"), LOG_LEVEL_NOTICE);
-            return;
-        }
-        if (!(await this.core.$everyCommitPendingFileEvent())) {
-            Logger($msg("Replicator.Message.Pending"), LOG_LEVEL_NOTICE);
-            return false;
-        }
-        if (!(await this.core.$everyBeforeReplicate(showMessage))) {
-            Logger($msg("Replicator.Message.SomeModuleFailed"), LOG_LEVEL_NOTICE);
-            return false;
-        }
 
-        //<-- Here could be an module.
-        const ret = await this.core.replicator.openReplication(this.settings, false, showMessage, false);
-        if (!ret) {
-            if (this.core.replicator.tweakSettingsMismatched && this.core.replicator.preferredTweakValue) {
-                await this.core.$$askResolvingMismatchedTweaks(this.core.replicator.preferredTweakValue);
-            } else {
-                if (this.core.replicator?.remoteLockedAndDeviceNotAccepted) {
-                    if (this.core.replicator.remoteCleaned && this.settings.useIndexedDBAdapter) {
-                        await this.cleaned(showMessage);
-                    } else {
-                        const message = $msg("Replicator.Dialogue.Locked.Message");
-                        const CHOICE_FETCH = $msg("Replicator.Dialogue.Locked.Action.Fetch");
-                        const CHOICE_DISMISS = $msg("Replicator.Dialogue.Locked.Action.Dismiss");
-                        const CHOICE_UNLOCK = $msg("Replicator.Dialogue.Locked.Action.Unlock");
-                        const ret = await this.core.confirm.askSelectStringDialogue(
-                            message,
-                            [CHOICE_FETCH, CHOICE_UNLOCK, CHOICE_DISMISS],
-                            {
-                                title: $msg("Replicator.Dialogue.Locked.Title"),
-                                defaultAction: CHOICE_DISMISS,
-                                timeout: 60,
-                            }
-                        );
-                        if (ret == CHOICE_FETCH) {
-                            this._log($msg("Replicator.Dialogue.Locked.Message.Fetch"), LOG_LEVEL_NOTICE);
-                            await this.core.rebuilder.scheduleFetch();
-                            this.core.$$scheduleAppReload();
-                            return;
-                        } else if (ret == CHOICE_UNLOCK) {
-                            await this.core.replicator.markRemoteResolved(this.settings);
-                            this._log($msg("Replicator.Dialogue.Locked.Message.Unlocked"), LOG_LEVEL_NOTICE);
-                            return;
+    private async onReplicationFailed(showMessage: boolean = false): Promise<boolean> {
+        const activeReplicator = this.services.replicator.getActiveReplicator();
+        if (!activeReplicator) {
+            Logger(`No active replicator found`, LOG_LEVEL_INFO);
+            return false;
+        }
+        if (activeReplicator.tweakSettingsMismatched && activeReplicator.preferredTweakValue) {
+            await this.services.tweakValue.askResolvingMismatched(activeReplicator.preferredTweakValue);
+        } else {
+            if (activeReplicator.remoteLockedAndDeviceNotAccepted) {
+                if (activeReplicator.remoteCleaned && this.settings.useIndexedDBAdapter) {
+                    await this.cleaned(showMessage);
+                } else {
+                    const message = $msg("Replicator.Dialogue.Locked.Message");
+                    const CHOICE_FETCH = $msg("Replicator.Dialogue.Locked.Action.Fetch");
+                    const CHOICE_DISMISS = $msg("Replicator.Dialogue.Locked.Action.Dismiss");
+                    const CHOICE_UNLOCK = $msg("Replicator.Dialogue.Locked.Action.Unlock");
+                    const ret = await this.core.confirm.askSelectStringDialogue(
+                        message,
+                        [CHOICE_FETCH, CHOICE_UNLOCK, CHOICE_DISMISS],
+                        {
+                            title: $msg("Replicator.Dialogue.Locked.Title"),
+                            defaultAction: CHOICE_DISMISS,
+                            timeout: 60,
                         }
+                    );
+                    if (ret == CHOICE_FETCH) {
+                        this._log($msg("Replicator.Dialogue.Locked.Message.Fetch"), LOG_LEVEL_NOTICE);
+                        await this.core.rebuilder.scheduleFetch();
+                        this.services.appLifecycle.scheduleRestart();
+                        return false;
+                    } else if (ret == CHOICE_UNLOCK) {
+                        await activeReplicator.markRemoteResolved(this.settings);
+                        this._log($msg("Replicator.Dialogue.Locked.Message.Unlocked"), LOG_LEVEL_NOTICE);
+                        return false;
                     }
                 }
             }
         }
-        return ret;
+        // TODO: Check again and true/false return. This will be the result for performReplication.
+        return false;
     }
 
-    async $$replicateByEvent(): Promise<boolean | void> {
-        const least = this.settings.syncMinimumInterval;
-        if (least > 0) {
-            return rateLimitedSharedExecution(KEY_REPLICATION_ON_EVENT, least, async () => {
-                return await this.$$replicate();
-            });
-        }
-        return await shareRunningResult(`replication`, () => this.core.$$replicate());
-    }
-    $$parseReplicationResult(docs: Array<PouchDB.Core.ExistingDocument<EntryDoc>>): void {
-        if (this.settings.suspendParseReplicationResult && !this.replicationResultProcessor.isSuspended) {
-            this.replicationResultProcessor.suspend();
-        }
-        this.replicationResultProcessor.enqueueAll(docs);
-        if (!this.settings.suspendParseReplicationResult && this.replicationResultProcessor.isSuspended) {
-            this.replicationResultProcessor.resume();
-        }
-    }
-    _saveQueuedFiles = throttle(() => {
-        const saveData = this.replicationResultProcessor._queue
-            .filter((e) => e !== undefined && e !== null)
-            .map((e) => e?._id ?? ("" as string)) as string[];
-        const kvDBKey = "queued-files";
-        // localStorage.setItem(lsKey, saveData);
-        fireAndForget(() => this.core.kvDB.set(kvDBKey, saveData));
-    }, 100);
-    saveQueuedFiles() {
-        this._saveQueuedFiles();
-    }
-    async loadQueuedFiles() {
-        if (this.settings.suspendParseReplicationResult) return;
-        if (!this.settings.isConfigured) return;
-        const kvDBKey = "queued-files";
-        // const ids = [...new Set(JSON.parse(localStorage.getItem(lsKey) || "[]"))] as string[];
-        const ids = [...new Set((await this.core.kvDB.get<string[]>(kvDBKey)) ?? [])];
-        const batchSize = 100;
-        const chunkedIds = arrayToChunkedArray(ids, batchSize);
+    // private async _replicateByEvent(): Promise<boolean | void> {
+    //     const least = this.settings.syncMinimumInterval;
+    //     if (least > 0) {
+    //         return rateLimitedSharedExecution(KEY_REPLICATION_ON_EVENT, least, async () => {
+    //             return await this.services.replication.replicate();
+    //         });
+    //     }
+    //     return await shareRunningResult(`replication`, () => this.services.replication.replicate());
+    // }
 
-        // suspendParseReplicationResult is true, so we have to resume it if it is suspended.
-        if (this.replicationResultProcessor.isSuspended) {
-            this.replicationResultProcessor.resume();
-        }
-        for await (const idsBatch of chunkedIds) {
-            const ret = await this.localDatabase.allDocsRaw<EntryDoc>({
-                keys: idsBatch,
-                include_docs: true,
-                limit: 100,
-            });
-            const docs = ret.rows.filter((e) => e.doc).map((e) => e.doc) as PouchDB.Core.ExistingDocument<EntryDoc>[];
-            const errors = ret.rows.filter((e) => !e.doc && !e.value.deleted);
-            if (errors.length > 0) {
-                Logger("Some queued processes were not resurrected");
-                Logger(JSON.stringify(errors), LOG_LEVEL_VERBOSE);
-            }
-            this.replicationResultProcessor.enqueueAll(docs);
-        }
-        if (this.replicationResultProcessor.isSuspended) {
-            this.replicationResultProcessor.resume();
-        }
-        await this.replicationResultProcessor.waitForAllProcessed();
-    }
-
-    replicationResultProcessor = new QueueProcessor(
-        async (docs: PouchDB.Core.ExistingDocument<EntryDoc>[]) => {
-            if (this.settings.suspendParseReplicationResult) return;
-            const change = docs[0];
-            if (!change) return;
-            if (isChunk(change._id)) {
-                globalSlipBoard.submit("read-chunk", change._id, change as EntryLeaf);
-                return;
-            }
-            if (await this.core.$anyModuleParsedReplicationResultItem(change)) return;
-            // any addon needs this item?
-            // for (const proc of this.core.addOns) {
-            //     if (await proc.parseReplicationResultItem(change)) {
-            //         return;
-            //     }
-            // }
-            if (change.type == "versioninfo") {
-                if (change.version > VER) {
-                    this.core.replicator.closeReplication();
-                    Logger(
-                        `Remote database updated to incompatible version. update your Self-hosted LiveSync plugin.`,
-                        LOG_LEVEL_NOTICE
-                    );
-                }
-                return;
-            }
-            if (
-                change._id == SYNCINFO_ID || // Synchronisation information data
-                change._id.startsWith("_design") //design document
-            ) {
-                return;
-            }
-            if (isAnyNote(change)) {
-                const docPath = getPath(change);
-                if (!(await this.core.$$isTargetFile(docPath))) {
-                    Logger(`Skipped: ${docPath}`, LOG_LEVEL_VERBOSE);
-                    return;
-                }
-                if (this.databaseQueuedProcessor._isSuspended) {
-                    Logger(`Processing scheduled: ${docPath}`, LOG_LEVEL_INFO);
-                }
-                const size = change.size;
-                if (this.core.$$isFileSizeExceeded(size)) {
-                    Logger(
-                        `Processing ${docPath} has been skipped due to file size exceeding the limit`,
-                        LOG_LEVEL_NOTICE
-                    );
-                    return;
-                }
-                this.databaseQueuedProcessor.enqueue(change);
-            }
-            return;
-        },
-        {
-            batchSize: 1,
-            suspended: true,
-            concurrentLimit: 100,
-            delay: 0,
-            totalRemainingReactiveSource: this.core.replicationResultCount,
-        }
-    )
-        .replaceEnqueueProcessor((queue, newItem) => {
-            const q = queue.filter((e) => e._id != newItem._id);
-            return [...q, newItem];
-        })
-        .startPipeline()
-        .onUpdateProgress(() => {
-            this.saveQueuedFiles();
-        });
-
-    databaseQueuedProcessor = new QueueProcessor(
-        async (docs: EntryBody[]) => {
-            const dbDoc = docs[0] as LoadedEntry; // It has no `data`
-            const path = getPath(dbDoc);
-
-            // If `Read chunks online` is disabled, chunks should be transferred before here.
-            // However, in some cases, chunks are after that. So, if missing chunks exist, we have to wait for them.
-            const doc = await this.localDatabase.getDBEntryFromMeta({ ...dbDoc }, false, true);
-            if (!doc) {
-                Logger(
-                    `Something went wrong while gathering content of ${path} (${dbDoc._id.substring(0, 8)}, ${dbDoc._rev?.substring(0, 10)}) `,
-                    LOG_LEVEL_NOTICE
-                );
-                return;
-            }
-
-            if (await this.core.$anyProcessOptionalSyncFiles(dbDoc)) {
-                // Already processed
-            } else if (isValidPath(getPath(doc))) {
-                this.storageApplyingProcessor.enqueue(doc as MetaEntry);
-            } else {
-                Logger(`Skipped: ${path} (${doc._id.substring(0, 8)})`, LOG_LEVEL_VERBOSE);
-            }
-            return;
-        },
-        {
-            suspended: true,
-            batchSize: 1,
-            concurrentLimit: 10,
-            yieldThreshold: 1,
-            delay: 0,
-            totalRemainingReactiveSource: this.core.databaseQueueCount,
-        }
-    )
-        .replaceEnqueueProcessor((queue, newItem) => {
-            const q = queue.filter((e) => e._id != newItem._id);
-            return [...q, newItem];
-        })
-        .startPipeline();
-
-    storageApplyingProcessor = new QueueProcessor(
-        async (docs: MetaEntry[]) => {
-            const entry = docs[0];
-            await this.core.$anyProcessReplicatedDoc(entry);
-            return;
-        },
-        {
-            suspended: true,
-            batchSize: 1,
-            concurrentLimit: 6,
-            yieldThreshold: 1,
-            delay: 0,
-            totalRemainingReactiveSource: this.core.storageApplyingCount,
-        }
-    )
-        .replaceEnqueueProcessor((queue, newItem) => {
-            const q = queue.filter((e) => e._id != newItem._id);
-            return [...q, newItem];
-        })
-        .startPipeline();
-
-    $everyBeforeSuspendProcess(): Promise<boolean> {
-        this.core.replicator.closeReplication();
+    _parseReplicationResult(docs: Array<PouchDB.Core.ExistingDocument<EntryDoc>>): Promise<boolean> {
+        this.processor.enqueueAll(docs);
         return Promise.resolve(true);
     }
 
-    async $$replicateAllToServer(
-        showingNotice: boolean = false,
-        sendChunksInBulkDisabled: boolean = false
-    ): Promise<boolean> {
-        if (!this.core.$$isReady()) return false;
-        if (!(await this.core.$everyBeforeReplicate(showingNotice))) {
-            Logger($msg("Replicator.Message.SomeModuleFailed"), LOG_LEVEL_NOTICE);
-            return false;
-        }
-        if (!sendChunksInBulkDisabled) {
-            if (this.core.replicator instanceof LiveSyncCouchDBReplicator) {
-                if (
-                    (await this.core.confirm.askYesNoDialog("Do you want to send all chunks before replication?", {
-                        defaultOption: "No",
-                        timeout: 20,
-                    })) == "yes"
-                ) {
-                    await this.core.replicator.sendChunks(this.core.settings, undefined, true, 0);
-                }
-            }
-        }
-        const ret = await this.core.replicator.replicateAllToServer(this.settings, showingNotice);
-        if (ret) return true;
-        const checkResult = await this.core.$anyAfterConnectCheckFailed();
-        if (checkResult == "CHECKAGAIN") return await this.core.$$replicateAllToServer(showingNotice);
-        return !checkResult;
-    }
-    async $$replicateAllFromServer(showingNotice: boolean = false): Promise<boolean> {
-        if (!this.core.$$isReady()) return false;
-        const ret = await this.core.replicator.replicateAllFromServer(this.settings, showingNotice);
-        if (ret) return true;
-        const checkResult = await this.core.$anyAfterConnectCheckFailed();
-        if (checkResult == "CHECKAGAIN") return await this.core.$$replicateAllFromServer(showingNotice);
-        return !checkResult;
+    // _everyBeforeSuspendProcess(): Promise<boolean> {
+    //     this.core.replicator?.closeReplication();
+    //     return Promise.resolve(true);
+    // }
+
+    // private async _replicateAllToServer(
+    //     showingNotice: boolean = false,
+    //     sendChunksInBulkDisabled: boolean = false
+    // ): Promise<boolean> {
+    //     if (!this.services.appLifecycle.isReady()) return false;
+    //     if (!(await this.services.replication.onBeforeReplicate(showingNotice))) {
+    //         Logger($msg("Replicator.Message.SomeModuleFailed"), LOG_LEVEL_NOTICE);
+    //         return false;
+    //     }
+    //     if (!sendChunksInBulkDisabled) {
+    //         if (this.core.replicator instanceof LiveSyncCouchDBReplicator) {
+    //             if (
+    //                 (await this.core.confirm.askYesNoDialog("Do you want to send all chunks before replication?", {
+    //                     defaultOption: "No",
+    //                     timeout: 20,
+    //                 })) == "yes"
+    //             ) {
+    //                 await this.core.replicator.sendChunks(this.core.settings, undefined, true, 0);
+    //             }
+    //         }
+    //     }
+    //     const ret = await this.core.replicator.replicateAllToServer(this.settings, showingNotice);
+    //     if (ret) return true;
+    //     const checkResult = await this.services.replication.checkConnectionFailure();
+    //     if (checkResult == "CHECKAGAIN") return await this.services.remote.replicateAllToRemote(showingNotice);
+    //     return !checkResult;
+    // }
+    // async _replicateAllFromServer(showingNotice: boolean = false): Promise<boolean> {
+    //     if (!this.services.appLifecycle.isReady()) return false;
+    //     const ret = await this.core.replicator.replicateAllFromServer(this.settings, showingNotice);
+    //     if (ret) return true;
+    //     const checkResult = await this.services.replication.checkConnectionFailure();
+    //     if (checkResult == "CHECKAGAIN") return await this.services.remote.replicateAllFromRemote(showingNotice);
+    //     return !checkResult;
+    // }
+
+    override onBindFunction(core: LiveSyncCore, services: typeof core.services): void {
+        services.replicator.onReplicatorInitialised.addHandler(this._onReplicatorInitialised.bind(this));
+        services.databaseEvents.onDatabaseInitialised.addHandler(this._everyOnDatabaseInitialized.bind(this));
+        services.appLifecycle.onSettingLoaded.addHandler(this._everyOnloadAfterLoadSettings.bind(this));
+        services.replication.parseSynchroniseResult.addHandler(this._parseReplicationResult.bind(this));
+
+        // --> These handlers can be separated.
+        const isOnlineAndCanReplicateWithHost = isOnlineAndCanReplicate.bind(null, this._unresolvedErrorManager, {
+            services: {
+                API: services.API,
+            },
+            serviceModules: {},
+        });
+        const canReplicateWithPBKDF2WithHost = canReplicateWithPBKDF2.bind(null, this._unresolvedErrorManager, {
+            services: {
+                replicator: services.replicator,
+                setting: services.setting,
+            },
+            serviceModules: {},
+        });
+        services.replication.onBeforeReplicate.addHandler(isOnlineAndCanReplicateWithHost, 10);
+        services.replication.onBeforeReplicate.addHandler(canReplicateWithPBKDF2WithHost, 20);
+        // <-- End of handlers that can be separated.
+        services.replication.onBeforeReplicate.addHandler(this._everyBeforeReplicate.bind(this), 100);
+        services.replication.onReplicationFailed.addHandler(this.onReplicationFailed.bind(this));
     }
 }

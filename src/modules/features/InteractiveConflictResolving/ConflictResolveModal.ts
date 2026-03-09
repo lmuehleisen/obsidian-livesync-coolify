@@ -25,8 +25,8 @@ export class ConflictResolveModal extends Modal {
     title: string = "Conflicting changes";
 
     pluginPickMode: boolean = false;
-    localName: string = "Keep A";
-    remoteName: string = "Keep B";
+    localName: string = "Base";
+    remoteName: string = "Conflicted";
     offEvent?: ReturnType<typeof eventHub.onEvent>;
 
     constructor(app: App, filename: string, diff: diff_result, pluginPickMode?: boolean, remoteName?: string) {
@@ -36,15 +36,15 @@ export class ConflictResolveModal extends Modal {
         this.pluginPickMode = pluginPickMode || false;
         if (this.pluginPickMode) {
             this.title = "Pick a version";
-            this.remoteName = `Use ${remoteName || "Remote"}`;
-            this.localName = "Use Local";
+            this.remoteName = `${remoteName || "Remote"}`;
+            this.localName = "Local";
         }
         // Send cancel signal for the previous merge dialogue
         // if not there, simply be ignored.
         // sendValue("close-resolve-conflict:" + this.filename, false);
     }
 
-    onOpen() {
+    override onOpen() {
         const { contentEl } = this;
         // Send cancel signal for the previous merge dialogue
         // if not there, simply be ignored.
@@ -63,6 +63,7 @@ export class ConflictResolveModal extends Modal {
         contentEl.createEl("span", { text: this.filename });
         const div = contentEl.createDiv("");
         div.addClass("op-scrollable");
+        div.addClass("ls-dialog");
         let diff = "";
         for (const v of this.result.diff) {
             const x1 = v[0];
@@ -85,20 +86,18 @@ export class ConflictResolveModal extends Modal {
             }
         }
 
-        diff = diff.replace(/\n/g, "<br>");
-        div.innerHTML = diff;
         const div2 = contentEl.createDiv("");
+        div2.addClass("ls-dialog");
         const date1 =
             new Date(this.result.left.mtime).toLocaleString() + (this.result.left.deleted ? " (Deleted)" : "");
         const date2 =
             new Date(this.result.right.mtime).toLocaleString() + (this.result.right.deleted ? " (Deleted)" : "");
-        div2.innerHTML = `
-<span class='deleted'>A:${date1}</span><br /><span class='added'>B:${date2}</span><br> 
-        `;
-        contentEl.createEl("button", { text: this.localName }, (e) =>
+        div2.innerHTML = `<span class='deleted'><span class='conflict-dev-name'>${this.localName}</span>: ${date1}</span><br>
+<span class='added'><span class='conflict-dev-name'>${this.remoteName}</span>: ${date2}</span><br>`;
+        contentEl.createEl("button", { text: `Use ${this.localName}` }, (e) =>
             e.addEventListener("click", () => this.sendResponse(this.result.right.rev))
         ).style.marginRight = "4px";
-        contentEl.createEl("button", { text: this.remoteName }, (e) =>
+        contentEl.createEl("button", { text: `Use ${this.remoteName}` }, (e) =>
             e.addEventListener("click", () => this.sendResponse(this.result.left.rev))
         ).style.marginRight = "4px";
         if (!this.pluginPickMode) {
@@ -109,6 +108,12 @@ export class ConflictResolveModal extends Modal {
         contentEl.createEl("button", { text: !this.pluginPickMode ? "Not now" : "Cancel" }, (e) =>
             e.addEventListener("click", () => this.sendResponse(CANCELLED))
         ).style.marginRight = "4px";
+        diff = diff.replace(/\n/g, "<br>");
+        if (diff.length > 100 * 1024) {
+            div.innerText = "(Too large diff to display)";
+        } else {
+            div.innerHTML = diff;
+        }
     }
 
     sendResponse(result: MergeDialogResult) {
@@ -116,7 +121,7 @@ export class ConflictResolveModal extends Modal {
         this.close();
     }
 
-    onClose() {
+    override onClose() {
         const { contentEl } = this;
         contentEl.empty();
         if (this.offEvent) {

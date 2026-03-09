@@ -1,4 +1,4 @@
-import { WorkspaceLeaf } from "obsidian";
+import { WorkspaceLeaf } from "@/deps.ts";
 import LogPaneComponent from "./LogPane.svelte";
 import type ObsidianLiveSyncPlugin from "../../../main.ts";
 import { SvelteItemView } from "../../../common/SvelteItemView.ts";
@@ -19,11 +19,11 @@ export class LogPaneView extends SvelteItemView {
     }
 
     plugin: ObsidianLiveSyncPlugin;
-    icon = "view-log";
+    override icon = "view-log";
     title: string = "";
-    navigation = false;
+    override navigation = false;
 
-    getIcon(): string {
+    override getIcon(): string {
         return "view-log";
     }
 

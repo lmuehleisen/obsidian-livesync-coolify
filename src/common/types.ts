@@ -1,11 +1,6 @@
 import { type PluginManifest, TFile } from "../deps.ts";
-import {
-    type DatabaseEntry,
-    type EntryBody,
-    type FilePath,
-    type UXFileInfoStub,
-    type UXInternalFileInfoStub,
-} from "../lib/src/common/types.ts";
+import { type DatabaseEntry, type EntryBody, type FilePath } from "../lib/src/common/types.ts";
+export type { CacheData, FileEventItem } from "../lib/src/common/types.ts";
 
 export interface PluginDataEntry extends DatabaseEntry {
     deviceVaultName: string;
@@ -54,38 +49,16 @@ export type queueItem = {
     warned?: boolean;
 };
 
-export type CacheData = string | ArrayBuffer;
-export type FileEventType = "CREATE" | "DELETE" | "CHANGED" | "INTERNAL";
-export type FileEventArgs = {
-    file: UXFileInfoStub | UXInternalFileInfoStub;
-    cache?: CacheData;
-    oldPath?: string;
-    ctx?: any;
-};
-export type FileEventItem = {
-    type: FileEventType;
-    args: FileEventArgs;
-    key: string;
-    skipBatchWait?: boolean;
-    cancelled?: boolean;
-    batched?: boolean;
-};
-
-// Hidden items (Now means `chunk`)
-export const CHeader = "h:";
-
-// Plug-in Stored Container (Obsolete)
-export const PSCHeader = "ps:";
-export const PSCHeaderEnd = "ps;";
-
-// Internal data Container
-export const ICHeader = "i:";
-export const ICHeaderEnd = "i;";
-export const ICHeaderLength = ICHeader.length;
-
-// Internal data Container (eXtended)
-export const ICXHeader = "ix:";
-
 export const FileWatchEventQueueMax = 10;
-export const configURIBase = "obsidian://setuplivesync?settings=";
-export const configURIBaseQR = "obsidian://setuplivesync?settingsQR=";
+
+export { configURIBase, configURIBaseQR } from "../lib/src/common/types.ts";
+
+export {
+    CHeader,
+    PSCHeader,
+    PSCHeaderEnd,
+    ICHeader,
+    ICHeaderEnd,
+    ICHeaderLength,
+    ICXHeader,
+} from "../lib/src/common/models/fileaccess.const.ts";

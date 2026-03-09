@@ -4,7 +4,7 @@ if you want to view the source, please visit the github repository of this plugi
 */
 `;
 
-const prod = process.argv[2] === "production";
+const prod = process.argv[2] === "production" || process.env?.BUILD_MODE === "production";
 /***
  * @type import("terser").MinifyOptions
  */
@@ -31,12 +31,12 @@ const terserOption = {
         evaluate: true,
         dead_code: true,
         // directives: true,
-        inline: 3,
+        inline: false,
         join_vars: true,
         loops: true,
         passes: 4,
         reduce_vars: true,
-        reduce_funcs: true,
+        reduce_funcs: false,
         arrows: true,
         collapse_vars: true,
         comparisons: true,

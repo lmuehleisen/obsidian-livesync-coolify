@@ -1,154 +1,248 @@
-## 0.24.27
+# 0.25
+Since 19th July, 2025 (beta1 in 0.25.0-beta1, 13th July, 2025)
 
-### Improved
+The head note of 0.25 is now in [updates_old.md](https://github.com/vrtmrz/obsidian-livesync/blob/main/updates_old.md). Because 0.25 got a lot of updates, thankfully, compatibility is kept and we do not need breaking changes! In other words, when get enough stabled. The next version will be v1.0.0. Even though it my hope.
 
-- We can use prefix for path for the Bucket synchronisation.
-    - For example, if you set the `vaultName/` as a prefix for the bucket in the root directory, all data will be transferred to the bucket under the `vaultName/` directory.
-- The "Use Request API to avoid `inevitable` CORS problem" option is now promoted to the normal setting, not a niche patch.
+## 0.25.51
 
-### Fixed
+7th March, 2026
 
-- Now switching replicators applied immediately, without the need to restart Obsidian.
+### Reverted
 
-### Tidied up
+- Reverted to ModuleRedFlag and ModuleInitializerFile to the previous version because of some unexpected issues. (#813)
+  - I will re-implement them in the future with better design and tests.
 
-- Some dependencies have been updated to the latest version.
+## 0.25.50
 
-## 0.24.26
+3rd March, 2026
 
-This update introduces an option to circumvent Cross-Origin Resource Sharing
-(CORS) constraints for CouchDB requests, by leveraging Obsidian's native request
-API. The implementation of such a feature had previously been deferred due to
-significant security considerations.
-
-CORS is a vital security mechanism, enabling servers like CouchDB -- which
-functions as a sophisticated REST API -- to control access from different
-origins, thereby ensuring secure communication across trust boundaries. I had
-long hesitated to offer a CORS circumvention method, as it deviates from
-security best practices; My preference was for users to configure CORS correctly
-on the server-side.
-
-However, this policy has shifted due to specific reports of intractable
-CORS-related configuration issues, particularly within enterprise proxy
-environments where proxy servers can unpredictably alter or block
-communications. Given that a primary objective of the "Self-hosted LiveSync"
-plugin is to facilitate secure Obsidian usage within stringent corporate
-settings, addressing these 'unavoidable' user-reported problems became
-essential. Mostly raison d'être of this plugin.
-
-Consequently, the option "Use Request API to avoid `inevitable` CORS problem"
-has been implemented. Users are strongly advised to enable this _only_ when
-operating within a trusted environment. We can enable this option in the `Patch` pane.
-
-However, just to whisper, this is tremendously fast.
-
-### New Features
-
-- Automatic display-language changing according to the Obsidian language
-  setting.
-    - We will be asked on the migration or first startup.
-    - **Note: Please revert to the default language if you report any issues.**
-    - Not all messages are translated yet. We welcome your contribution!
-- Now we can limit files to be synchronised even in the hidden files.
-- "Use Request API to avoid `inevitable` CORS problem" has been implemented.
-    - Less secure, please use it only if you are sure that you are in the trusted
-      environment and be able to ignore the CORS. No `Web viewer` or similar tools
-      are recommended. (To avoid the origin forged attack). If you are able to
-      configure the server setting, always that is recommended.
-- `Show status icon instead of file warnings banner` has been implemented.
-    - If enabled, the ⛔ icon will be shown inside the status instead of the file
-      warnings banner. No details will be shown.
-
-### Improved
-
-- All regular expressions can be inverted by prefixing `!!` now.
+Note: 0.25.49 has been skipped because of too verbose logging (credentials are logged in verbose level, but I realised that could lead to unexpected exposure on issue reporting). Please bump to 0.25.50 to get the fix if you are on 0.25.49. (No expected behaviour changes except the logging).
 
 ### Fixed
 
-- No longer unexpected files will be gathered during hidden file sync.
-- No longer broken `\n` and new-line characters during the bucket
-  synchronisation.
-- We can purge the remote bucket again if we using MinIO instead of AWS S3 or
-  Cloudflare R2.
-- Purging the remote bucket is now more reliable.
-    - 100 files are purged at a time.
-- Some wrong messages have been fixed.
-
-### Behaviour changed
-
-- Entering into the deeper directories to gather the hidden files is now limited
-  by `/` or `\/` prefixed ignore filters. (It means that directories are scanned
-  deeper than before).
-    - However, inside the these directories, the files are still limited by the
-      ignore filters.
-
-### Etcetera
-
-- Some code has been tidied up.
-- Trying less warning-suppressing and be more safer-coding.
-- Dependent libraries have been updated to the latest version.
-- Some build processes have been separated to `pre` and `post` processes.
-
-## 0.24.25
-
-### Improved
-
-- Peer-to-peer synchronisation has been got more robust.
-
-### Fixed
-
-- No longer broken falsy values in settings during set-up by the QR code
-  generation.
+- No longer deleted files are not clickable in the Global History pane.
+- Diff view now uses more specific classes (#803).
+- A message of configuration mismatching slightly added for better understanding.
+    - Now it says `When replication is initiated manually via the command palette or ribbon, a dialogue box will open to address this.` to make it clear that the user can fix the issue by themselves.
 
 ### Refactored
 
-- Some `window` references now have pointed to `globalThis`.
-- Some sloppy-import has been fixed.
-- A server side implementation `Synchromesh` has been suffixed with `deno`
-  instead of `server` now.
+- `ModuleRedFlag` has been refactored to `serviceFeatures/redFlag` and also tested.
+- `ModuleInitializerFile` has been refactored to `lib/serviceFeatures/offlineScanner` and also tested.
 
-## 0.24.24
+## 0.25.48
 
-### Fixed
+2nd March, 2026
 
-- No longer broken JSON files including `\n`, during the bucket synchronisation.
-  (#623)
-- Custom headers and JWT tokens are now correctly sent to the server during
-  configuration checking. (#624)
+No behavioural changes except unidentified faults. Please report if you find any unexpected behaviour after this update.
 
-### Improved
+### Refactored
 
-- Bucket synchronisation has been enhanced for better performance and
-  reliability.
-    - Now less duplicated chunks are sent to the server. Note: If you have
-      encountered about too less chunks, please let me know. However, you can send
-      it to the server by `Overwrite remote`.
-    - Fetching conflicted files from the server is now more reliable.
-    - Dependent libraries have been updated to the latest version.
-        - Also, let me know if you have encountered any issues with this update.
-          Especially you are using a device that has been in use for a little
-          longer.
+- Many storage-related functions have been refactored for better maintainability and testability.
+    - Now all platform-specific logics are supplied as adapters, and the core logic has become platform-agnostic.
+    - Quite a number of tests have been added for the core logic, and the platform-specific logics are also tested with mocked adapters.
 
-## 0.24.23
+## 0.25.47
 
-### New Feature
+27th February, 2026
 
-- Now, we can send custom headers to the server.
-    - They can be sent to either CouchDB or Object Storage.
-- Authentication with JWT in CouchDB is now supported.
-    - I will describe steps later, but please refer to the
-      [CouchDB document](https://docs.couchdb.org/en/stable/config/auth.html#authentication-configuration).
-    - A JWT keypair for testing can be generated in the setting dialogue.
+Phew, the financial year is still not over yet, but I have got some time to work on the plug-in again!
 
-### Improved
+### Fixed and refactored
 
-- The QR Code for set-up can be shown also from the setting dialogue now.
-- Conflict checking for preventing unexpected overwriting on the boot-up process
-  has been quite faster.
+- Fixed the inexplicable behaviour when retrieving chunks from the network.
+    - The chunk manager has been layered to be responsible for its own areas and duties. e.g., `DatabaseWriteLayer`, `DatabaseReadLayer`, `NetworkLayer`, `CacheLayer`, and `ArrivalWaitLayer`.
+        - All layers have been tested now!
+        - `LayeredChunkManager` has been implemented to manage these layers. Also tested.
+    - `EntryManager` has been mostly rewritten and also tested.
+
+- Now we can configure `Never warn` for remote storage size notification again.
+
+### Tests
+
+- The following test has been added:
+    - `ConflictManager`.
+
+## 0.25.46
+
+26th February, 2026
 
 ### Fixed
 
-- Some bugs on Dev and Testing modules have been fixed.
+- Unexpected errors no longer occurred when the plug-in was unloaded.
+- Hidden File Sync now respects selectors.
+- Registering protocol-handlers now works safely without causing unexpected errors.
 
-Older notes are in
+### Refactored
+
+- `ModuleCheckRemoteSize` has been ported to a serviceFeature, and tests have also been added.
+- Some unnecessary things have been removed.
+- LiveSyncManagers has now explicit dependencies.
+- LiveSyncLocalDB is now responsible for LiveSyncManagers, not accepting the managers as dependencies.
+    - This is to avoid circular dependencies and clarify the ownership of the managers.
+- ChangeManager has been refactored. This had a potential issue, so something had been fixed, possibly.
+- Some tests have been ported from Deno's test runner to Vitest to accumulate coverage.
+
+## 0.25.45
+
+25th February, 2026
+
+As a result of recent refactoring, we are able to write tests more easily now!
+
+### Refactored
+
+- `ModuleTargetFilter`, which was responsible for checking if a file is a target file, has been ported to a serviceFeature.
+    - And also tests have been added. The middleware-style-power.
+- `ModuleObsidianAPI` has been removed and implemented in `APIService` and `RemoteService`.
+- Now `APIService` is responsible for the network-online-status, not `databaseService.managers.networkManager`.
+
+## 0.25.44
+
+24th February, 2026
+
+This release represents a significant architectural overhaul of the plug-in, focusing on modularity, testability, and stability. While many changes are internal, they pave the way for more robust features and easier maintenance.
+However, as this update is very substantial, please do feel free to let me know if you encounter any issues.
+
+### Fixed
+
+- Ignore files (e.g., `.ignore`) are now handled efficiently.
+- Replication & Database:
+    - Replication statistics are now correctly reset after switching replicators.
+- Fixed `File already exists` for .md files has been merged (PR #802) So thanks @waspeer for the contribution!
+
+### Improved
+
+- Now we can configure network-error banners as icons, or hide them completely with the new `Network Warning Style` setting in the `General` pane of the settings dialogue. (#770, PR #804)
+    - Thanks so much to @A-wry!
+
+### Refactored
+
+#### Architectural Overhaul:
+
+- A major transition from Class-based Modules to a Service/Middleware architecture has begun.
+    - Many modules (for example, `ModulePouchDB`, `ModuleLocalDatabaseObsidian`, `ModuleKeyValueDB`) have been removed or integrated into specific Services (`database`, `keyValueDB`, etc.).
+    - Reduced reliance on dynamic binding and inverted dependencies; dependencies are now explicit.
+    - `ObsidianLiveSyncPlugin` properties (`replicator`, `localDatabase`, `storageAccess`, etc.) have been moved to their respective services for better separation of concerns.
+    - In this refactoring, the Service will henceforth, as a rule, cease to use setHandler, that is to say, simple lazy binding.
+        - They will be implemented directly in the service.
+    - However, not everything will be middlewarised. Modules that maintain state or make decisions based on the results of multiple handlers are permitted.
+- Lifecycle:
+    - Application LifeCycle now starts in `Main` rather than `ServiceHub` or `ObsidianMenuModule`, ensuring smoother startup coordination.
+
+#### New Services & Utilities:
+
+- Added a `control` service to orchestrate other services (for example, handling stop/start logic during settings realisation).
+- Added `UnresolvedErrorManager` to handle and display unresolved errors in a unified way.
+- Added `logUtils` to unify logging injection and formatting.
+- `VaultService.isTargetFile` now uses multiple, distinct checkers for better extensibility.
+
+#### Code Separation:
+
+- Separated Obsidian-specific logic from base logic for `StorageEventManager` and `FileAccess` modules.
+- Moved reactive state values and statistics from the main plug-in instance to the services responsible for them.
+
+#### Internal Cleanups:
+
+- Many functions have been renamed for clarity (for example, `_isTargetFileByLocalDB` is now `_isTargetAcceptedByLocalDB`).
+- Added `override` keywords to overridden items and removed dynamic binding for clearer code inheritance.
+- Moved common functions to the common library.
+
+#### Dependencies:
+
+- Bumped dependencies simply to a point where they can be considered problem-free (by human-powered-artefacts-diff).
+    - Svelte, terser, and more something will be bumped later. They have a significant impact on the diff and paint it totally.
+    - You may be surprised, but when I bump the library, I am actually checking for any unintended code.
+
+## 0.25.43
+
+5th, February, 2026
+
+### Fixed
+
+- Encryption/decryption issues when using Object Storage as remote have been fixed.
+    - Now the plug-in falls back to V1 encryption/decryption when V2 fails (if not configured as ForceV1).
+    - This may fix the issue reported in #772.
+
+### Notice
+
+Quite a few packages have been updated in this release. Please report if you find any unexpected behaviour after this update.
+
+## 0.25.42
+
+2nd, February, 2026
+
+This release is identical to 0.25.41-patched-3, except for the version number.
+
+### Refactored
+
+- Now the service context is `protected` instead of `private` in `ServiceBase`.
+    - This change allows derived classes to access the context directly.
+- Some dynamically bound services have been moved to services for better dependency management.
+- `WebPeer` has been moved to the main repository from the sub repository `livesync-commonlib` for correct dependency management.
+- Migrated from the outdated, unstable platform abstraction layer to services.
+    - A bit more services will be added in the future for better maintainability.
+
+## 0.25.41
+
+24th January, 2026
+
+### Fixed
+
+- No longer `No available splitter for settings!!` errors occur after fetching old remote settings while rebuilding local database. (#748)
+
+### Improved
+
+- Boot sequence warning is now kept in the in-editor notification area.
+
+### New feature
+
+- We can now set the maximum modified time for reflect events in the settings. (for #754)
+    - This setting can be configured from `Patches` -> `Remediation` in the settings dialogue.
+    - Enabling this setting will restrict the propagation from the database to storage to only those changes made before the specified date and time.
+    - This feature is primarily intended for recovery purposes. After placing `redflag.md` in an empty vault and importing the Self-hosted LiveSync configuration, please perform this configuration, and then fetch the local database from the remote.
+    - This feature is useful when we want to prevent recent unwanted changes from being reflected in the local storage.
+
+### Refactored
+
+- Module to service refactoring has been started for better maintainability:
+    - UI module has been moved to UI service.
+
+### Behaviour change
+
+- Default chunk splitter version has been changed to `Rabin-Karp` for new installations.
+
+## 0.25.40
+
+23rd January, 2026
+
+### Fixed
+
+- Fixed an issue where some events were not triggered correctly after the refactoring in 0.25.39.
+
+## 0.25.39
+
+23rd January, 2026
+
+Also no behaviour changes or fixes in this release. Just refactoring for better maintainability. Thank you for your patience! I will address some of the reported issues soon.
+However, this is not a minor refactoring, so please be careful. Let me know if you find any unexpected behaviour after this update.
+
+### Refactored
+
+- Rewrite the service's binding/handler assignment systems
+- Removed loopholes that allowed traversal between services to clarify dependencies.
+- Consolidated the hidden state-related state, the handler, and the addition of bindings to the handler into a single object.
+    - Currently, functions that can have handlers added implement either addHandler or setHandler directly on the function itself.
+      I understand there are differing opinions on this, but for now, this is how it stands.
+- Services now possess a Context. Please ensure each platform has a class that inherits from ServiceContext.
+- To permit services to be dynamically bound, the services themselves are now defined by interfaces.
+
+## 0.25.38
+
+17th January, 2026
+
+### Fixed
+
+- Fixed an issue where indexedDB would not close correctly on some environments, causing unexpected errors during database operations.
+
+Full notes are in
 [updates_old.md](https://github.com/vrtmrz/obsidian-livesync/blob/main/updates_old.md).

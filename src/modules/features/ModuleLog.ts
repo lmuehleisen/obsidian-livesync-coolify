@@ -15,44 +15,58 @@ import {
     hiddenFilesEventCount,
     hiddenFilesProcessingCount,
     type LogEntry,
-    logStore,
     logMessages,
 } from "../../lib/src/mock_and_interop/stores.ts";
 import { eventHub } from "../../lib/src/hub/hub.ts";
-import { EVENT_FILE_RENAMED, EVENT_LAYOUT_READY, EVENT_LEAF_ACTIVE_CHANGED } from "../../common/events.ts";
-import { AbstractObsidianModule, type IObsidianModule } from "../AbstractObsidianModule.ts";
+import {
+    EVENT_FILE_RENAMED,
+    EVENT_LAYOUT_READY,
+    EVENT_LEAF_ACTIVE_CHANGED,
+    EVENT_ON_UNRESOLVED_ERROR,
+} from "../../common/events.ts";
+import { AbstractObsidianModule } from "../AbstractObsidianModule.ts";
 import { addIcon, normalizePath, Notice } from "../../deps.ts";
 import { LOG_LEVEL_NOTICE, setGlobalLogFunction } from "octagonal-wheels/common/logger";
-import { QueueProcessor } from "octagonal-wheels/concurrency/processor";
 import { LogPaneView, VIEW_TYPE_LOG } from "./Log/LogPaneView.ts";
 import { serialized } from "octagonal-wheels/concurrency/lock";
 import { $msg } from "src/lib/src/common/i18n.ts";
 import { P2PLogCollector } from "../../lib/src/replication/trystero/P2PReplicatorCore.ts";
+import type { LiveSyncCore } from "../../main.ts";
+import { LiveSyncError } from "@lib/common/LSError.ts";
+import { isValidPath } from "@/common/utils.ts";
+import {
+    isValidFilenameInAndroid,
+    isValidFilenameInDarwin,
+    isValidFilenameInWidows,
+} from "@lib/string_and_binary/path.ts";
+import { MARK_LOG_NETWORK_ERROR, MARK_LOG_SEPARATOR } from "@lib/services/lib/logUtils.ts";
+import { NetworkWarningStyles } from "@lib/common/models/setting.const.ts";
 
 // This module cannot be a core module because it depends on the Obsidian UI.
 
 // DI the log again.
-setGlobalLogFunction((message: any, level?: number, key?: string) => {
-    const entry = { message, level, key } as LogEntry;
-    logStore.enqueue(entry);
-});
+const recentLogEntries = reactiveSource<LogEntry[]>([]);
+const globalLogFunction = (message: any, level?: number, key?: string) => {
+    const messageX =
+        message instanceof Error
+            ? new LiveSyncError("[Error Logged]: " + message.message, { cause: message })
+            : message;
+    const entry = { message: messageX, level, key } as LogEntry;
+    recentLogEntries.value = [...recentLogEntries.value, entry];
+};
+
+setGlobalLogFunction(globalLogFunction);
 let recentLogs = [] as string[];
 
-// Recent log splicer
-const recentLogProcessor = new QueueProcessor(
-    (logs: string[]) => {
-        recentLogs = [...recentLogs, ...logs].splice(-200);
-        logMessages.value = recentLogs;
-    },
-    { batchSize: 25, delay: 10, suspended: false, concurrentLimit: 1 }
-).resumePipeLine();
+function addLog(log: string) {
+    recentLogs = [...recentLogs, log].splice(-200);
+    logMessages.value = recentLogs;
+}
 // logStore.intercept(e => e.slice(Math.min(e.length - 200, 0)));
 
 const showDebugLog = false;
 export const MARK_DONE = "\u{2009}\u{2009}";
-export class ModuleLog extends AbstractObsidianModule implements IObsidianModule {
-    registerView = this.plugin.registerView.bind(this.plugin);
-
+export class ModuleLog extends AbstractObsidianModule {
     statusBar?: HTMLElement;
 
     statusDiv?: HTMLElement;
@@ -89,12 +103,12 @@ export class ModuleLog extends AbstractObsidianModule implements IObsidianModule
             });
             return computed(() => formatted.value);
         }
-        const labelReplication = padLeftSpComputed(this.core.replicationResultCount, `📥`);
-        const labelDBCount = padLeftSpComputed(this.core.databaseQueueCount, `📄`);
-        const labelStorageCount = padLeftSpComputed(this.core.storageApplyingCount, `💾`);
+        const labelReplication = padLeftSpComputed(this.services.replication.replicationResultCount, `📥`);
+        const labelDBCount = padLeftSpComputed(this.services.replication.databaseQueueCount, `📄`);
+        const labelStorageCount = padLeftSpComputed(this.services.replication.storageApplyingCount, `💾`);
         const labelChunkCount = padLeftSpComputed(collectingChunks, `🧩`);
         const labelPluginScanCount = padLeftSpComputed(pluginScanningCount, `🔌`);
-        const labelConflictProcessCount = padLeftSpComputed(this.core.conflictProcessQueueCount, `🔩`);
+        const labelConflictProcessCount = padLeftSpComputed(this.services.conflict.conflictProcessQueueCount, `🔩`);
         const hiddenFilesCount = reactive(() => hiddenFilesEventCount.value - hiddenFilesProcessingCount.value);
         const labelHiddenFilesCount = padLeftSpComputed(hiddenFilesCount, `⚙️`);
         const queueCountLabelX = reactive(() => {
@@ -103,12 +117,12 @@ export class ModuleLog extends AbstractObsidianModule implements IObsidianModule
         const queueCountLabel = () => queueCountLabelX.value;
 
         const requestingStatLabel = computed(() => {
-            const diff = this.core.requestCount.value - this.core.responseCount.value;
+            const diff = this.services.API.requestCount.value - this.services.API.responseCount.value;
             return diff != 0 ? "📲 " : "";
         });
 
         const replicationStatLabel = computed(() => {
-            const e = this.core.replicationStat.value;
+            const e = this.services.replicator.replicationStatics.value;
             const sent = e.sent;
             const arrived = e.arrived;
             const maxPullSeq = e.maxPullSeq;
@@ -160,9 +174,9 @@ export class ModuleLog extends AbstractObsidianModule implements IObsidianModule
             }
             return { w, sent, pushLast, arrived, pullLast };
         });
-        const labelProc = padLeftSpComputed(this.core.processing, `⏳`);
-        const labelPend = padLeftSpComputed(this.core.totalQueued, `🛫`);
-        const labelInBatchDelay = padLeftSpComputed(this.core.batched, `📬`);
+        const labelProc = padLeftSpComputed(this.services.fileProcessing.processing, `⏳`);
+        const labelPend = padLeftSpComputed(this.services.fileProcessing.totalQueued, `🛫`);
+        const labelInBatchDelay = padLeftSpComputed(this.services.fileProcessing.batched, `📬`);
         const waitingLabel = computed(() => {
             return `${labelProc()}${labelPend()}${labelInBatchDelay()}`;
         });
@@ -178,7 +192,7 @@ export class ModuleLog extends AbstractObsidianModule implements IObsidianModule
         });
 
         const statusBarLabels = reactive(() => {
-            const scheduleMessage = this.core.$$isReloadingScheduled()
+            const scheduleMessage = this.services.appLifecycle.isReloadingScheduled()
                 ? `WARNING! RESTARTING OBSIDIAN IS SCHEDULED!\n`
                 : "";
             const { message } = statusLineLabel();
@@ -197,11 +211,13 @@ export class ModuleLog extends AbstractObsidianModule implements IObsidianModule
             this.applyStatusBarText();
         }, 20);
         statusBarLabels.onChanged((label) => applyToDisplay(label.value));
+        this.activeFileStatus.onChanged(() => this.updateMessageArea());
     }
 
-    $everyOnload(): Promise<boolean> {
+    private _everyOnload(): Promise<boolean> {
         eventHub.onEvent(EVENT_LEAF_ACTIVE_CHANGED, () => this.onActiveLeafChange());
         eventHub.onceEvent(EVENT_LAYOUT_READY, () => this.onActiveLeafChange());
+        eventHub.onEvent(EVENT_ON_UNRESOLVED_ERROR, () => this.updateMessageArea());
 
         return Promise.resolve(true);
     }
@@ -216,25 +232,75 @@ export class ModuleLog extends AbstractObsidianModule implements IObsidianModule
     }
 
     async getActiveFileStatus() {
+        const reason = [] as string[];
+        const reasonWarn = [] as string[];
         const thisFile = this.app.workspace.getActiveFile();
         if (!thisFile) return "";
+        const validPath = isValidPath(thisFile.path);
+        if (!validPath) {
+            reason.push("This file has an invalid path under the current settings");
+        } else {
+            // The most narrow check: Filename validity on Windows
+            const validOnWindows = isValidFilenameInWidows(thisFile.name);
+            const validOnDarwin = isValidFilenameInDarwin(thisFile.name);
+            const validOnAndroid = isValidFilenameInAndroid(thisFile.name);
+            const labels = [];
+            if (!validOnWindows) labels.push("🪟");
+            if (!validOnDarwin) labels.push("🍎");
+            if (!validOnAndroid) labels.push("🤖");
+            if (labels.length > 0) {
+                reasonWarn.push("Some platforms may be unable to process this file correctly: " + labels.join(" "));
+            }
+        }
         // Case Sensitivity
-        if (this.core.$$shouldCheckCaseInsensitive()) {
+        if (this.services.vault.shouldCheckCaseInsensitively()) {
             const f = this.core.storageAccess
                 .getFiles()
                 .map((e) => e.path)
                 .filter((e) => e.toLowerCase() == thisFile.path.toLowerCase());
-            if (f.length > 1) return "Not synchronised: There are multiple files with the same name";
+            if (f.length > 1) {
+                reason.push("There are multiple files with the same name (case-insensitive match)");
+            }
         }
-        if (!(await this.core.$$isTargetFile(thisFile.path))) return "Not synchronised: not a target file";
-        if (this.core.$$isFileSizeExceeded(thisFile.stat.size)) return "Not synchronised: File size exceeded";
-        return "";
+        if (!(await this.services.vault.isTargetFile(thisFile.path))) {
+            reason.push("This file is ignored by the ignore rules");
+        }
+        if (this.services.vault.isFileSizeTooLarge(thisFile.stat.size)) {
+            reason.push("This file size exceeds the configured limit");
+        }
+        const result = reason.length > 0 ? "Not synchronised: " + reason.join(", ") : "";
+        const warnResult = reasonWarn.length > 0 ? "Warning: " + reasonWarn.join(", ") : "";
+        return [result, warnResult].filter((e) => e).join("\n");
     }
     async setFileStatus() {
         const fileStatus = await this.getActiveFileStatus();
         this.activeFileStatus.value = fileStatus;
-        this.messageArea!.innerText = this.settings.hideFileWarningNotice ? "" : fileStatus;
     }
+
+    async updateMessageArea() {
+        if (this.messageArea) {
+            const messageLines = [];
+            const fileStatus = this.activeFileStatus.value;
+            if (fileStatus && !this.settings.hideFileWarningNotice) messageLines.push(fileStatus);
+            const messages = (await this.services.appLifecycle.getUnresolvedMessages()).flat().filter((e) => e);
+            const stringMessages = messages.filter((m): m is string => typeof m === "string"); // for 'startsWith'
+            const networkMessages = stringMessages.filter((m) => m.startsWith(MARK_LOG_NETWORK_ERROR));
+            const otherMessages = stringMessages.filter((m) => !m.startsWith(MARK_LOG_NETWORK_ERROR));
+
+            messageLines.push(...otherMessages);
+
+            if (
+                this.settings.networkWarningStyle !== NetworkWarningStyles.ICON &&
+                this.settings.networkWarningStyle !== NetworkWarningStyles.HIDDEN
+            ) {
+                messageLines.push(...networkMessages);
+            } else if (this.settings.networkWarningStyle === NetworkWarningStyles.ICON) {
+                if (networkMessages.length > 0) messageLines.push("🔗❌");
+            }
+            this.messageArea.innerText = messageLines.map((e) => `⚠️ ${e}`).join("\n");
+        }
+    }
+
     onActiveLeafChange() {
         fireAndForget(async () => {
             this.adjustStatusDivPosition();
@@ -255,9 +321,9 @@ export class ModuleLog extends AbstractObsidianModule implements IObsidianModule
             // const recent = logMessages.value;
             const newMsg = message;
             let newLog = this.settings?.showOnlyIconsOnEditor ? "" : status;
-            const moduleTagEnd = newLog.indexOf(`]\u{200A}`);
+            const moduleTagEnd = newLog.indexOf(`]${MARK_LOG_SEPARATOR}`);
             if (moduleTagEnd != -1) {
-                newLog = newLog.substring(moduleTagEnd + 2);
+                newLog = newLog.substring(moduleTagEnd + MARK_LOG_SEPARATOR.length + 1);
             }
 
             this.statusBar?.setText(newMsg.split("\n")[0]);
@@ -287,14 +353,14 @@ export class ModuleLog extends AbstractObsidianModule implements IObsidianModule
         });
     }
 
-    $allStartOnUnload(): Promise<boolean> {
+    private _allStartOnUnload(): Promise<boolean> {
         if (this.statusDiv) {
             this.statusDiv.remove();
         }
         document.querySelectorAll(`.livesync-status`)?.forEach((e) => e.remove());
         return Promise.resolve(true);
     }
-    $everyOnloadStart(): Promise<boolean> {
+    _everyOnloadStart(): Promise<boolean> {
         addIcon(
             "view-log",
             `<g transform="matrix(1.28 0 0 1.28 -131 -411)" fill="currentColor" fill-rule="evenodd">
@@ -303,30 +369,26 @@ export class ModuleLog extends AbstractObsidianModule implements IObsidianModule
        </g>`
         );
         this.addRibbonIcon("view-log", $msg("moduleLog.showLog"), () => {
-            void this.core.$$showView(VIEW_TYPE_LOG);
+            void this.services.API.showWindow(VIEW_TYPE_LOG);
         }).addClass("livesync-ribbon-showlog");
 
         this.addCommand({
             id: "view-log",
             name: "Show log",
             callback: () => {
-                void this.core.$$showView(VIEW_TYPE_LOG);
+                void this.services.API.showWindow(VIEW_TYPE_LOG);
             },
         });
         this.registerView(VIEW_TYPE_LOG, (leaf) => new LogPaneView(leaf, this.plugin));
         return Promise.resolve(true);
     }
-    $everyOnloadAfterLoadSettings(): Promise<boolean> {
-        logStore
-            .pipeTo(
-                new QueueProcessor((logs) => logs.forEach((e) => this.core.$$addLog(e.message, e.level, e.key)), {
-                    suspended: false,
-                    batchSize: 20,
-                    concurrentLimit: 1,
-                    delay: 0,
-                })
-            )
-            .startPipeline();
+    private _everyOnloadAfterLoadSettings(): Promise<boolean> {
+        recentLogEntries.onChanged((entries) => {
+            if (entries.value.length === 0) return;
+            const newEntries = [...entries.value];
+            recentLogEntries.value = [];
+            newEntries.forEach((e) => this.__addLog(e.message, e.level, e.key));
+        });
         eventHub.onEvent(EVENT_FILE_RENAMED, (data) => {
             void this.setFileStatus();
         });
@@ -366,39 +428,49 @@ export class ModuleLog extends AbstractObsidianModule implements IObsidianModule
             })
         );
     }
-    $$addLog(message: any, level: LOG_LEVEL = LOG_LEVEL_INFO, key = ""): void {
+    __addLog(message: any, level: LOG_LEVEL = LOG_LEVEL_INFO, key = ""): void {
         if (level == LOG_LEVEL_DEBUG && !showDebugLog) {
             return;
         }
-        if (level < LOG_LEVEL_INFO && this.settings && this.settings.lessInformationInLog) {
+        if (level <= LOG_LEVEL_INFO && this.settings && this.settings.lessInformationInLog) {
             return;
         }
         if (this.settings && !this.settings.showVerboseLog && level == LOG_LEVEL_VERBOSE) {
             return;
         }
-        const vaultName = this.core.$$getVaultName();
+        const vaultName = this.services.vault.getVaultName();
         const now = new Date();
         const timestamp = now.toLocaleString();
+        let errorInfo = "";
+        if (message instanceof Error) {
+            if (message instanceof LiveSyncError) {
+                errorInfo = `${message.cause?.name}:${message.cause?.message}\n[StackTrace]: ${message.stack}\n[CausedBy]: ${message.cause?.stack}`;
+            } else {
+                const thisStack = new Error().stack;
+                errorInfo = `${message.name}:${message.message}\n[StackTrace]: ${message.stack}\n[LogCallStack]: ${thisStack}`;
+            }
+        }
         const messageContent =
             typeof message == "string"
                 ? message
                 : message instanceof Error
-                  ? `${message.name}:${message.message}`
+                  ? `${errorInfo}`
                   : JSON.stringify(message, null, 2);
-        if (message instanceof Error) {
-            // debugger;
-            console.dir(message.stack);
-        }
         const newMessage = timestamp + "->" + messageContent;
-
-        console.log(vaultName + ":" + newMessage);
+        if (message instanceof Error) {
+            console.error(vaultName + ":" + newMessage);
+        } else if (level >= LOG_LEVEL_INFO) {
+            console.log(vaultName + ":" + newMessage);
+        } else {
+            console.debug(vaultName + ":" + newMessage);
+        }
         if (!this.settings?.showOnlyIconsOnEditor) {
             this.statusLog.value = messageContent;
         }
         if (this.settings?.writeLogToTheFile) {
             this.writeLogToTheFile(now, vaultName, newMessage);
         }
-        recentLogProcessor.enqueue(newMessage);
+        addLog(newMessage);
         this.logLines.push({ ttl: now.getTime() + 3000, message: newMessage });
 
         if (level >= LOG_LEVEL_NOTICE) {
@@ -436,5 +508,12 @@ export class ModuleLog extends AbstractObsidianModule implements IObsidianModule
                 });
             }
         }
+    }
+    override onBindFunction(core: LiveSyncCore, services: typeof core.services): void {
+        services.API.addLog.setHandler(globalLogFunction);
+        services.appLifecycle.onInitialise.addHandler(this._everyOnloadStart.bind(this));
+        services.appLifecycle.onSettingLoaded.addHandler(this._everyOnloadAfterLoadSettings.bind(this));
+        services.appLifecycle.onLoaded.addHandler(this._everyOnload.bind(this));
+        services.appLifecycle.onBeforeUnload.addHandler(this._allStartOnUnload.bind(this));
     }
 }

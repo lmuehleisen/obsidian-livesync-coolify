@@ -1,4 +1,4 @@
-import { Menu, WorkspaceLeaf } from "obsidian";
+import { Menu, WorkspaceLeaf } from "@/deps.ts";
 import ReplicatorPaneComponent from "./P2PReplicatorPane.svelte";
 import type ObsidianLiveSyncPlugin from "../../../main.ts";
 import { mount } from "svelte";
@@ -35,11 +35,11 @@ function removeFromList(item: string, list: string) {
 
 export class P2PReplicatorPaneView extends SvelteItemView {
     plugin: ObsidianLiveSyncPlugin;
-    icon = "waypoints";
+    override icon = "waypoints";
     title: string = "";
-    navigation = false;
+    override navigation = false;
 
-    getIcon(): string {
+    override getIcon(): string {
         return "waypoints";
     }
     get replicator() {
@@ -95,7 +95,7 @@ And you can also drop the local database to rebuild from the remote device.`,
                 if (yn === DROP) {
                     await this.plugin.rebuilder.scheduleFetch();
                 } else {
-                    await this.plugin.$$scheduleAppReload();
+                    this.plugin.services.appLifecycle.scheduleRestart();
                 }
             } else {
                 Logger(`Cancelled\nRemote config for ${peer.name} is not applied`, LOG_LEVEL_NOTICE);

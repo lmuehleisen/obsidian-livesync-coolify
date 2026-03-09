@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   couchdb:
     build: .
@@ -13,7 +11,7 @@ services:
       - "5984:5984"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5984/_up"]
+      test: ["CMD-SHELL", "curl -f -u \"$${COUCHDB_USER}:$${COUCHDB_PASSWORD}\" http://localhost:5984/_up || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3

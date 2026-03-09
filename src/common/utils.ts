@@ -23,18 +23,18 @@ import {
     type UXFileInfo,
     type UXFileInfoStub,
 } from "../lib/src/common/types.ts";
-import { CHeader, ICHeader, ICHeaderLength, ICXHeader, PSCHeader } from "./types.ts";
+export { ICHeader, ICXHeader } from "./types.ts";
 import type ObsidianLiveSyncPlugin from "../main.ts";
 import { writeString } from "../lib/src/string_and_binary/convert.ts";
 import { fireAndForget } from "../lib/src/common/utils.ts";
 import { sameChangePairs } from "./stores.ts";
-import type { KeyValueDatabase } from "./KeyValueDB.ts";
+
 import { scheduleTask } from "octagonal-wheels/concurrency/task";
 import { EVENT_PLUGIN_UNLOADED, eventHub } from "./events.ts";
-import { promiseWithResolver, type PromiseWithResolvers } from "octagonal-wheels/promises";
 import { AuthorizationHeaderGenerator } from "../lib/src/replication/httplib.ts";
+import type { KeyValueDatabase } from "../lib/src/interfaces/KeyValueDatabase.ts";
 
-export { scheduleTask, cancelTask, cancelAllTasks } from "../lib/src/concurrency/task.ts";
+export { scheduleTask, cancelTask, cancelAllTasks } from "octagonal-wheels/concurrency/task";
 
 // For backward compatibility, using the path for determining id.
 // Only CouchDB unacceptable ID (that starts with an underscore) has been prefixed with "/".
@@ -62,37 +62,18 @@ export function id2path(id: DocumentID, entry?: EntryHasPath): FilePathWithPrefi
     const fixedPath = temp.join(":") as FilePathWithPrefix;
     return fixedPath;
 }
-export function getPath(entry: AnyEntry) {
-    return id2path(entry._id, entry);
-}
-export function getPathWithoutPrefix(entry: AnyEntry) {
-    const f = getPath(entry);
-    return stripAllPrefixes(f);
-}
 
 export function getPathFromTFile(file: TAbstractFile) {
     return file.path as FilePath;
 }
 
-export function isInternalFile(file: UXFileInfoStub | string | FilePathWithPrefix) {
-    if (typeof file == "string") return file.startsWith(ICHeader);
-    if (file.isInternal) return true;
-    return false;
-}
-export function getPathFromUXFileInfo(file: UXFileInfoStub | string | FilePathWithPrefix) {
-    if (typeof file == "string") return file as FilePathWithPrefix;
-    return file.path;
-}
-export function getStoragePathFromUXFileInfo(file: UXFileInfoStub | string | FilePathWithPrefix) {
-    if (typeof file == "string") return stripAllPrefixes(file as FilePathWithPrefix);
-    return stripAllPrefixes(file.path);
-}
-export function getDatabasePathFromUXFileInfo(file: UXFileInfoStub | string | FilePathWithPrefix) {
-    if (typeof file == "string" && file.startsWith(ICXHeader)) return file as FilePathWithPrefix;
-    const prefix = isInternalFile(file) ? ICHeader : "";
-    if (typeof file == "string") return (prefix + stripAllPrefixes(file as FilePathWithPrefix)) as FilePathWithPrefix;
-    return (prefix + stripAllPrefixes(file.path)) as FilePathWithPrefix;
-}
+import {
+    isInternalFile,
+    getPathFromUXFileInfo,
+    getStoragePathFromUXFileInfo,
+    getDatabasePathFromUXFileInfo,
+} from "@lib/common/typeUtils.ts";
+export { isInternalFile, getPathFromUXFileInfo, getStoragePathFromUXFileInfo, getDatabasePathFromUXFileInfo };
 
 const memos: { [key: string]: any } = {};
 export function memoObject<T>(key: string, obj: T): T {
@@ -136,32 +117,14 @@ export function trimPrefix(target: string, prefix: string) {
     return target.startsWith(prefix) ? target.substring(prefix.length) : target;
 }
 
-/**
- * returns is internal chunk of file
- * @param id ID
- * @returns
- */
-export function isInternalMetadata(id: FilePath | FilePathWithPrefix | DocumentID): boolean {
-    return id.startsWith(ICHeader);
-}
-export function stripInternalMetadataPrefix<T extends FilePath | FilePathWithPrefix | DocumentID>(id: T): T {
-    return id.substring(ICHeaderLength) as T;
-}
-export function id2InternalMetadataId(id: DocumentID): DocumentID {
-    return (ICHeader + id) as DocumentID;
-}
-
-// const CHeaderLength = CHeader.length;
-export function isChunk(str: string): boolean {
-    return str.startsWith(CHeader);
-}
-
-export function isPluginMetadata(str: string): boolean {
-    return str.startsWith(PSCHeader);
-}
-export function isCustomisationSyncMetadata(str: string): boolean {
-    return str.startsWith(ICXHeader);
-}
+export {
+    isInternalMetadata,
+    id2InternalMetadataId,
+    isChunk,
+    isCustomisationSyncMetadata,
+    isPluginMetadata,
+    stripInternalMetadataPrefix,
+} from "@lib/common/typeUtils.ts";
 
 export class PeriodicProcessor {
     _process: () => Promise<any>;
@@ -188,7 +151,7 @@ export class PeriodicProcessor {
             () =>
                 fireAndForget(async () => {
                     await this.process();
-                    if (this._plugin.$$isUnloaded()) {
+                    if (this._plugin.services?.control?.hasUnloaded()) {
                         this.disable();
                     }
                 }),
@@ -291,25 +254,11 @@ export function requestToCouchDBWithCredentials(
     return _requestToCouchDB(baseUri, credentials, origin, uri, body, method, customHeaders);
 }
 
-export const BASE_IS_NEW = Symbol("base");
-export const TARGET_IS_NEW = Symbol("target");
-export const EVEN = Symbol("even");
-
+import { BASE_IS_NEW, EVEN, TARGET_IS_NEW } from "@lib/common/models/shared.const.symbols.ts";
+export { BASE_IS_NEW, EVEN, TARGET_IS_NEW };
 // Why 2000? : ZIP FILE Does not have enough resolution.
-const resolution = 2000;
-export function compareMTime(
-    baseMTime: number,
-    targetMTime: number
-): typeof BASE_IS_NEW | typeof TARGET_IS_NEW | typeof EVEN {
-    const truncatedBaseMTime = ~~(baseMTime / resolution) * resolution;
-    const truncatedTargetMTime = ~~(targetMTime / resolution) * resolution;
-    // Logger(`Resolution MTime ${truncatedBaseMTime} and ${truncatedTargetMTime} `, LOG_LEVEL_VERBOSE);
-    if (truncatedBaseMTime == truncatedTargetMTime) return EVEN;
-    if (truncatedBaseMTime > truncatedTargetMTime) return BASE_IS_NEW;
-    if (truncatedBaseMTime < truncatedTargetMTime) return TARGET_IS_NEW;
-    throw new Error("Unexpected error");
-}
-
+import { compareMTime } from "@lib/common/utils.ts";
+export { compareMTime };
 function getKey(file: AnyEntry | string | UXFileInfoStub) {
     const key = typeof file == "string" ? file : stripAllPrefixes(file.path);
     return key;
@@ -429,30 +378,6 @@ export function displayRev(rev: string) {
     return `${number}-${hash.substring(0, 6)}`;
 }
 
-type DocumentProps = {
-    id: DocumentID;
-    rev?: string;
-    prefixedPath: FilePathWithPrefix;
-    path: FilePath;
-    isDeleted: boolean;
-    revDisplay: string;
-    shortenedId: string;
-    shortenedPath: string;
-};
-
-export function getDocProps(doc: AnyEntry): DocumentProps {
-    const id = doc._id;
-    const shortenedId = id.substring(0, 10);
-    const prefixedPath = getPath(doc);
-    const path = stripAllPrefixes(prefixedPath);
-    const rev = doc._rev;
-    const revDisplay = rev ? displayRev(rev) : "0-NOREVS";
-    // const prefix = prefixedPath.substring(0, prefixedPath.length - path.length);
-    const shortenedPath = path.substring(0, 10);
-    const isDeleted = doc._deleted || doc.deleted || false;
-    return { id, rev, revDisplay, prefixedPath, path, isDeleted, shortenedId, shortenedPath };
-}
-
 export function getLogLevel(showNotice: boolean) {
     return showNotice ? LOG_LEVEL_NOTICE : LOG_LEVEL_INFO;
 }
@@ -520,164 +445,4 @@ export function onlyInNTimes(n: number, proc: (progress: number) => any) {
             proc(counter);
         }
     };
-}
-
-const waitingTasks = {} as Record<string, { task?: PromiseWithResolvers<any>; previous: number; leastNext: number }>;
-
-export function rateLimitedSharedExecution<T>(key: string, interval: number, proc: () => Promise<T>): Promise<T> {
-    if (!(key in waitingTasks)) {
-        waitingTasks[key] = { task: undefined, previous: 0, leastNext: 0 };
-    }
-    if (waitingTasks[key].task) {
-        // Extend the previous execution time.
-        waitingTasks[key].leastNext = Date.now() + interval;
-        return waitingTasks[key].task.promise;
-    }
-
-    const previous = waitingTasks[key].previous;
-
-    const delay = previous == 0 ? 0 : Math.max(interval - (Date.now() - previous), 0);
-
-    const task = promiseWithResolver<T>();
-    void task.promise.finally(() => {
-        if (waitingTasks[key].task === task) {
-            waitingTasks[key].task = undefined;
-            waitingTasks[key].previous = Math.max(Date.now(), waitingTasks[key].leastNext);
-        }
-    });
-    waitingTasks[key] = {
-        task,
-        previous: Date.now(),
-        leastNext: Date.now() + interval,
-    };
-    void scheduleTask("thin-out-" + key, delay, async () => {
-        try {
-            task.resolve(await proc());
-        } catch (ex) {
-            task.reject(ex);
-        }
-    });
-    return task.promise;
-}
-export function updatePreviousExecutionTime(key: string, timeDelta: number = 0) {
-    if (!(key in waitingTasks)) {
-        waitingTasks[key] = { task: undefined, previous: 0, leastNext: 0 };
-    }
-    waitingTasks[key].leastNext = Math.max(Date.now() + timeDelta, waitingTasks[key].leastNext);
-}
-
-const prefixMapObject = {
-    s: {
-        1: "V",
-        2: "W",
-        3: "X",
-        4: "Y",
-        5: "Z",
-    },
-    o: {
-        1: "v",
-        2: "w",
-        3: "x",
-        4: "y",
-        5: "z",
-    },
-} as Record<string, Record<number, string>>;
-
-const decodePrefixMapObject = Object.fromEntries(
-    Object.entries(prefixMapObject).flatMap(([prefix, map]) =>
-        Object.entries(map).map(([len, char]) => [char, { prefix, len: parseInt(len) }])
-    )
-);
-
-const prefixMapNumber = {
-    n: {
-        1: "a",
-        2: "b",
-        3: "c",
-        4: "d",
-        5: "e",
-    },
-    N: {
-        1: "A",
-        2: "B",
-        3: "C",
-        4: "D",
-        5: "E",
-    },
-} as Record<string, Record<number, string>>;
-
-const decodePrefixMapNumber = Object.fromEntries(
-    Object.entries(prefixMapNumber).flatMap(([prefix, map]) =>
-        Object.entries(map).map(([len, char]) => [char, { prefix, len: parseInt(len) }])
-    )
-);
-export function encodeAnyArray(obj: any[]): string {
-    const tempArray = obj.map((v) => {
-        if (v === null) return "n";
-        if (v === false) return "f";
-        if (v === true) return "t";
-        if (v === undefined) return "u";
-        if (typeof v == "number") {
-            const b36 = v.toString(36);
-            const strNum = v.toString();
-            const expression = b36.length < strNum.length ? "N" : "n";
-            const encodedStr = expression == "N" ? b36 : strNum;
-            const len = encodedStr.length.toString(36);
-            const lenLen = len.length;
-
-            const prefix2 = prefixMapNumber[expression][lenLen];
-            return prefix2 + len + encodedStr;
-        }
-        const str = typeof v == "string" ? v : JSON.stringify(v);
-        const prefix = typeof v == "string" ? "s" : "o";
-        const length = str.length.toString(36);
-        const lenLen = length.length;
-
-        const prefix2 = prefixMapObject[prefix][lenLen];
-        return prefix2 + length + str;
-    });
-    const w = tempArray.join("");
-    return w;
-}
-
-const decodeMapConstant = {
-    u: undefined,
-    n: null,
-    f: false,
-    t: true,
-} as Record<string, any>;
-export function decodeAnyArray(str: string): any[] {
-    const result = [];
-    let i = 0;
-    while (i < str.length) {
-        const char = str[i];
-        i++;
-        if (char in decodeMapConstant) {
-            result.push(decodeMapConstant[char]);
-            continue;
-        }
-        if (char in decodePrefixMapNumber) {
-            const { prefix, len } = decodePrefixMapNumber[char];
-            const lenStr = str.substring(i, i + len);
-            i += len;
-            const radix = prefix == "N" ? 36 : 10;
-            const lenNum = parseInt(lenStr, 36);
-            const value = str.substring(i, i + lenNum);
-            i += lenNum;
-            result.push(parseInt(value, radix));
-            continue;
-        }
-        const { prefix, len } = decodePrefixMapObject[char];
-        const lenStr = str.substring(i, i + len);
-        i += len;
-        const lenNum = parseInt(lenStr, 36);
-        const value = str.substring(i, i + lenNum);
-        i += lenNum;
-        if (prefix == "s") {
-            result.push(value);
-        } else {
-            result.push(JSON.parse(value));
-        }
-    }
-    return result;
 }

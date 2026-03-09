@@ -1,11 +1,12 @@
 import { fireAndForget } from "octagonal-wheels/promises";
 import { addIcon, type Editor, type MarkdownFileInfo, type MarkdownView } from "../../deps.ts";
 import { LOG_LEVEL_NOTICE, type FilePathWithPrefix } from "../../lib/src/common/types.ts";
-import { AbstractObsidianModule, type IObsidianModule } from "../AbstractObsidianModule.ts";
 import { $msg } from "src/lib/src/common/i18n.ts";
+import type { LiveSyncCore } from "../../main.ts";
+import { AbstractModule } from "../AbstractModule.ts";
 
-export class ModuleObsidianMenu extends AbstractObsidianModule implements IObsidianModule {
-    $everyOnloadStart(): Promise<boolean> {
+export class ModuleObsidianMenu extends AbstractModule {
+    _everyOnloadStart(): Promise<boolean> {
         // UI
         addIcon(
             "replicate",
@@ -18,21 +19,21 @@ export class ModuleObsidianMenu extends AbstractObsidianModule implements IObsid
         );
 
         this.addRibbonIcon("replicate", $msg("moduleObsidianMenu.replicate"), async () => {
-            await this.core.$$replicate(true);
+            await this.services.replication.replicate(true);
         }).addClass("livesync-ribbon-replicate");
 
         this.addCommand({
             id: "livesync-replicate",
             name: "Replicate now",
             callback: async () => {
-                await this.core.$$replicate();
+                await this.services.replication.replicate();
             },
         });
         this.addCommand({
             id: "livesync-dump",
             name: "Dump information of this doc ",
             callback: () => {
-                const file = this.core.$$getActiveFilePath();
+                const file = this.services.vault.getActiveFilePath();
                 if (!file) return;
                 fireAndForget(() => this.localDatabase.getDBEntry(file, {}, true, false));
             },
@@ -43,7 +44,7 @@ export class ModuleObsidianMenu extends AbstractObsidianModule implements IObsid
             editorCallback: (editor: Editor, view: MarkdownView | MarkdownFileInfo) => {
                 const file = view.file;
                 if (!file) return;
-                void this.core.$$queueConflictCheckIfOpen(file.path as FilePathWithPrefix);
+                void this.services.conflict.queueCheckForIfOpen(file.path as FilePathWithPrefix);
             },
         });
 
@@ -58,23 +59,23 @@ export class ModuleObsidianMenu extends AbstractObsidianModule implements IObsid
                     this.settings.liveSync = true;
                     this._log("LiveSync Enabled.", LOG_LEVEL_NOTICE);
                 }
-                await this.core.$$realizeSettingSyncMode();
-                await this.core.$$saveSettingData();
+                await this.services.control.applySettings();
+                await this.services.setting.saveSettingData();
             },
         });
         this.addCommand({
             id: "livesync-suspendall",
             name: "Toggle All Sync.",
             callback: async () => {
-                if (this.core.$$isSuspended()) {
-                    this.core.$$setSuspended(false);
+                if (this.services.appLifecycle.isSuspended()) {
+                    this.services.appLifecycle.setSuspended(false);
                     this._log("Self-hosted LiveSync resumed", LOG_LEVEL_NOTICE);
                 } else {
-                    this.core.$$setSuspended(true);
+                    this.services.appLifecycle.setSuspended(true);
                     this._log("Self-hosted LiveSync suspended", LOG_LEVEL_NOTICE);
                 }
-                await this.core.$$realizeSettingSyncMode();
-                await this.core.$$saveSettingData();
+                await this.services.control.applySettings();
+                await this.services.setting.saveSettingData();
             },
         });
 
@@ -82,7 +83,7 @@ export class ModuleObsidianMenu extends AbstractObsidianModule implements IObsid
             id: "livesync-scan-files",
             name: "Scan storage and database again",
             callback: async () => {
-                await this.core.$$performFullScan(true);
+                await this.services.vault.scanVault(true);
             },
         });
 
@@ -90,7 +91,7 @@ export class ModuleObsidianMenu extends AbstractObsidianModule implements IObsid
             id: "livesync-runbatch",
             name: "Run pended batch processes",
             callback: async () => {
-                await this.core.$everyCommitPendingFileEvent();
+                await this.services.fileProcessing.commitPendingFileEvents();
             },
         });
 
@@ -104,26 +105,8 @@ export class ModuleObsidianMenu extends AbstractObsidianModule implements IObsid
         });
         return Promise.resolve(true);
     }
-    $everyOnload(): Promise<boolean> {
-        this.app.workspace.onLayoutReady(this.core.$$onLiveSyncReady.bind(this.core));
-        return Promise.resolve(true);
-    }
 
-    async $$showView(viewType: string) {
-        const leaves = this.app.workspace.getLeavesOfType(viewType);
-        if (leaves.length == 0) {
-            await this.app.workspace.getLeaf(true).setViewState({
-                type: viewType,
-                active: true,
-            });
-        } else {
-            await leaves[0].setViewState({
-                type: viewType,
-                active: true,
-            });
-        }
-        if (leaves.length > 0) {
-            await this.app.workspace.revealLeaf(leaves[0]);
-        }
+    override onBindFunction(core: LiveSyncCore, services: typeof core.services): void {
+        services.appLifecycle.onInitialise.addHandler(this._everyOnloadStart.bind(this));
     }
 }
