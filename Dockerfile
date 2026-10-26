@@ -1,9 +1,9 @@
 # Use CouchDB as the base image
-FROM couchdb:3.4
+FROM couchdb:3.5.3@sha256:4e8e0a366208a87d5059b0f4fcbefff13c32401a655d4629c19be6288ea77675
 
 # Create necessary directories
 RUN apt-get update \
- && apt-get install -y --no-install-recommends curl \
+ && apt-get install -y --no-install-recommends curl libbrotli1 \
  && rm -rf /var/lib/apt/lists/* \
  && mkdir -p /opt/couchdb/data /opt/couchdb/etc/local.d
 
